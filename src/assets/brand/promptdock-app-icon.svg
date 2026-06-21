@@ -1,0 +1,40 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="184" y1="132" x2="872" y2="902" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#C84BFF"/>
+      <stop offset="0.46" stop-color="#6E4BFF"/>
+      <stop offset="1" stop-color="#0D7CFF"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="218" y1="122" x2="806" y2="732" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="innerBlue" x1="646" y1="610" x2="812" y2="804" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7B55FF"/>
+      <stop offset="1" stop-color="#0D7CFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="104" y="104" width="816" height="816" rx="204" fill="url(#bg)"/>
+  <rect x="104" y="104" width="816" height="816" rx="204" fill="url(#gloss)"/>
+
+  <path
+    d="M300 320C300 286.9 326.9 260 360 260H648C709.9 260 760 310.1 760 372V564C760 625.9 709.9 676 648 676H430.8C404.8 676 379.3 683.6 357.5 697.8L304.9 732.1C288.9 742.5 267.6 731.1 267.6 712V352.4C267.6 334.5 282.1 320 300 320Z"
+    fill="white"
+    opacity="0.97"
+  />
+
+  <rect x="366" y="362" width="284" height="42" rx="21" fill="url(#bg)"/>
+  <rect x="346" y="474" width="216" height="42" rx="21" fill="url(#bg)"/>
+  <rect x="326" y="586" width="152" height="42" rx="21" fill="url(#bg)"/>
+
+  <path
+    d="M724 498C739.7 498 753.8 507.7 759.5 522.3L780.1 575.3C790.6 602.4 812 623.8 839.1 634.3L891.8 654.7C906.4 660.4 916.1 674.5 916.1 690.2C916.1 705.9 906.4 720 891.8 725.7L839.1 746.1C812 756.6 790.6 778 780.1 805.1L759.5 858.1C753.8 872.7 739.7 882.4 724 882.4C708.3 882.4 694.2 872.7 688.5 858.1L667.9 805.1C657.4 778 636 756.6 608.9 746.1L556.2 725.7C541.6 720 531.9 705.9 531.9 690.2C531.9 674.5 541.6 660.4 556.2 654.7L608.9 634.3C636 623.8 657.4 602.4 667.9 575.3L688.5 522.3C694.2 507.7 708.3 498 724 498Z"
+    fill="white"
+  />
+  <path
+    d="M724 596L745.4 651.2C752.9 670.5 768.1 685.7 787.4 693.2L841.8 714.2L787.4 735.2C768.1 742.7 752.9 757.9 745.4 777.2L724 832.4L702.6 777.2C695.1 757.9 679.9 742.7 660.6 735.2L606.2 714.2L660.6 693.2C679.9 685.7 695.1 670.5 702.6 651.2L724 596Z"
+    fill="url(#innerBlue)"
+  />
+</svg>

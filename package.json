@@ -1,0 +1,51 @@
+{
+  "name": "promptdock",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A local-first prompt manager for macOS.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test:e2e": "playwright install chromium && playwright test",
+    "audit:npm": "pnpm audit --audit-level moderate",
+    "audit:rust": "cd src-tauri && cargo audit --stale",
+    "audit:rust:strict": "cd src-tauri && cargo audit --deny warnings --stale",
+    "audit:all": "pnpm run audit:npm && pnpm run audit:rust",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build --bundles app",
+    "tauri:build:dmg": "tauri build --bundles dmg"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.5.0",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/inter": "^5.2.8",
+    "@tailwindcss/vite": "^4.3.1",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "lucide-react": "^1.17.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "shadcn": "^4.11.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.1",
+    "tw-animate-css": "^1.4.0",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "esbuild": "^0.28.1",
+    "typescript": "~5.8.3",
+    "vite": "^8.0.16"
+  }
+}
