@@ -2,7 +2,7 @@
 
 PromptDock 是一款运行在 macOS 上的本地优先 Prompt 管理工具，适合保存、整理、搜索和复用常用提示词，并支持通过大模型 API 对 Prompt 进行润色和自动分类。
 
-![PromptDock Logo](public/promptdock-logo.png)
+![PromptDock 界面预览](docs/images/ScreenShot_2026-06-21_211459_743.png)
 
 ## 功能特性
 
