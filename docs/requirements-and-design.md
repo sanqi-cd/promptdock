@@ -137,8 +137,13 @@ App
 
 ```
 React UI → Zustand Store → invoke() → Tauri Command → rusqlite → SQLite
-                                     ↘ reqwest → AI API → macOS Keychain
+                                     ↘ reqwest → AI API
+                                       (API Key 从 api_configs 明文列读取，未使用 Keychain)
 ```
+
+> 实现说明（2026-09-21 校正）：早期设计稿曾规划 macOS Keychain 存储 API Key，
+> **该方案未落地**。当前 Key 以明文存于 SQLite 的 `api_configs.api_key` 列。
+> 详见 `README.md` 安全说明与 `CLAUDE.md` 安全现状。
 
 Zustand Stores (不变):
 - `promptStore` — Prompt CRUD, 搜索, 分类, 润色

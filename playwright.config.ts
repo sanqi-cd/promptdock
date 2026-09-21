@@ -12,7 +12,12 @@ export default defineConfig({
   },
   use: {
     baseURL: "http://localhost:1420",
-    browserName: "chromium",
     headless: true,
   },
+  // 桌面端实际运行在 macOS 的 WKWebView 里。只跑 Chromium 会漏掉引擎差异 ——
+  // 这正是「以为覆盖了、其实没有」的典型来源。两个项目用同一套用例。
+  projects: [
+    { name: "chromium", use: { browserName: "chromium" } },
+    { name: "webkit", use: { browserName: "webkit" } },
+  ],
 });

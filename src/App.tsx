@@ -24,11 +24,16 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false);
 
   const loadConfigs = useSettingsStore((s) => s.loadConfigs);
+  const loadPrompts = usePromptStore((s) => s.loadPrompts);
   const theme = useThemeStore((s) => s.theme);
 
   useEffect(() => {
     loadConfigs();
-  }, [loadConfigs]);
+    // Load prompts up front: the sidebar counts, the explore view and the right
+    // panel all derive from `prompts`, and only the list view used to fetch them
+    // — so a cold start showed "no prompts yet" on data that existed.
+    loadPrompts();
+  }, [loadConfigs, loadPrompts]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -41,6 +46,9 @@ function App() {
 
       const store = usePromptStore.getState();
       if (target === "list") {
+        // 切换列表模式时丢弃上一轮搜索，否则搜索结果会劫持收藏 / 最近使用 / 分类
+        // 视图 —— 标题变了，内容却还是搜索结果。
+        store.clearSearch();
         if (mode === "favorites") {
           store.setFavoriteOnly(true);
           store.setSelectedCategory(null);
@@ -76,7 +84,10 @@ function App() {
   }, []);
 
   const handleSelectCategory = useCallback((cat: string) => {
-    usePromptStore.getState().setSelectedCategory(cat);
+    // 这条路径不经过 handleNavigate，同样要清掉上一轮搜索。
+    const store = usePromptStore.getState();
+    store.clearSearch();
+    store.setSelectedCategory(cat);
     setListMode("category");
     setMainView("list");
   }, []);

@@ -3,6 +3,8 @@ mod api_configs;
 mod commands;
 mod db;
 mod models;
+mod polish_prompts;
+mod search;
 
 use commands::DbState;
 use std::sync::Mutex;
@@ -28,7 +30,7 @@ pub fn run() {
             commands::toggle_favorite,
             commands::get_prompt_tags,
             commands::set_prompt_tags,
-            commands::update_prompt_meta,
+            commands::apply_classification,
             commands::search_prompts,
             ai::analyze_polish_process,
             ai::polish_prompt,

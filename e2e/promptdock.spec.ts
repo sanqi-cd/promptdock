@@ -728,3 +728,292 @@ test.describe("交叉导航", () => {
     }
   });
 });
+
+/**
+ * 后端时间戳的展示。
+ *
+ * 后端写的是 `datetime('now','localtime')` → `"2026-06-21 19:36:00"`：非 ISO 8601、
+ * 不带时区，`new Date()` 对它怎么处理是 ECMA-262 未规定的。这套用例在 Chromium
+ * （playwright 默认）和 WebKit（贴近实际发布用的 WKWebView）下都会跑，
+ * 用来证明两种引擎表现一致。
+ */
+test.describe("时间戳展示", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") {
+            return [
+              {
+                id: "cfg",
+                name: "测试配置",
+                provider: "openai",
+                base_url: "https://example.test",
+                model: "gpt-4.1-mini",
+                is_active: true,
+                created_at: "2026-06-21 19:36:00",
+              },
+            ];
+          }
+          if (cmd === "list_prompts") {
+            return [
+              {
+                id: "p1",
+                title: "时间戳用例",
+                content: "内容",
+                optimized_content: null,
+                category: null,
+                summary: null,
+                is_favorite: false,
+                // 后端真实格式：非 ISO、无时区
+                created_at: "2026-06-21 19:36:00",
+                updated_at: "2026-06-21 19:36:00",
+                last_used_at: "2026-06-21 19:36:00",
+              },
+            ];
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+  });
+
+  test("列表卡片显示可读日期而不是 Invalid Date", async ({ page }) => {
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+
+    await expect(page.getByText("时间戳用例")).toBeVisible();
+    await expect(page.getByText("Invalid Date")).toHaveCount(0);
+    // 2026-06-21 在 zh-CN 下的日期表示
+    await expect(page.getByText(/2026\/6\/21/).first()).toBeVisible();
+  });
+
+  test("无法解析的时间戳显示为空，而不是 Invalid Date", async ({ page }) => {
+    // 回归测试：`conn_now()` 在查询失败时会把字面量 `"unknown"` 写进 updated_at，
+    // 于是卡片上出现 "Invalid Date"。现在解析失败一律返回空串。
+    await page.addInitScript(() => {
+      const internals = window.__TAURI_INTERNALS__ as {
+        invoke: (cmd: string) => Promise<unknown>;
+      };
+      const original = internals.invoke;
+      internals.invoke = async (cmd: string) => {
+        if (cmd !== "list_prompts") return original(cmd);
+        return [
+          {
+            id: "p-bad",
+            title: "坏时间戳",
+            content: "内容",
+            optimized_content: null,
+            category: null,
+            summary: null,
+            is_favorite: false,
+            created_at: "unknown",
+            updated_at: "unknown",
+            last_used_at: "unknown",
+          },
+        ];
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+
+    await expect(page.getByText("坏时间戳")).toBeVisible();
+    await expect(page.getByText("Invalid Date")).toHaveCount(0);
+  });
+
+  test("设置页显示可读日期而不是 Invalid Date", async ({ page }) => {
+    await page.goto(BASE);
+    await page.locator("aside button", { hasText: "设置" }).click();
+
+    await expect(page.getByText("测试配置")).toBeVisible();
+    await expect(page.getByText("Invalid Date")).toHaveCount(0);
+    await expect(page.getByText(/2026\/6\/21/).first()).toBeVisible();
+  });
+});
+
+/** 无标题的 Prompt 落库后会在列表里显示「未命名」，几乎找不回来。 */
+test.describe("标题兜底", () => {
+  test("未填标题时用正文首行生成标题", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__createCalls = [];
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "create_prompt") {
+            (window.__createCalls as Record<string, unknown>[]).push({ ...args });
+            return {
+              id: "created-1",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-06-21 19:36:00",
+              updated_at: "2026-06-21 19:36:00",
+              last_used_at: null,
+            };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page
+      .locator("textarea")
+      .first()
+      .fill("帮我写一个关于 AI 的视频脚本\n第二行不该成为标题");
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+
+    await expect
+      .poll(async () =>
+        page.evaluate(() => (window.__createCalls as Record<string, unknown>[]).length)
+      )
+      .toBeGreaterThan(0);
+
+    const title = await page.evaluate(
+      () => (window.__createCalls as Record<string, unknown>[])[0].title
+    );
+    expect(title).toBe("帮我写一个关于 AI 的视频脚本");
+  });
+});
+
+/**
+ * 列表数据竞态回归测试。
+ *
+ * 侧边栏切换筛选会并发发出多个 `list_prompts`（点一次分类最多 5 个）。如果响应
+ * 乱序返回、后到的旧结果直接写入 store，用户就会看到「标题是全部 Prompt，内容
+ * 却是收藏列表」。这里让「收藏」的响应明显慢于「全部」，制造确定的乱序。
+ */
+test.describe("列表筛选竞态", () => {
+  const FAVORITES_DELAY_MS = 400;
+  const ALL_DELAY_MS = 20;
+
+  test("快速切换筛选时慢的旧响应不会覆盖新视图", async ({ page }) => {
+    await page.addInitScript(
+      ({ favoritesDelay, allDelay }: { favoritesDelay: number; allDelay: number }) => {
+        const makePrompts = (prefix: string) =>
+          Array.from({ length: 2 }, (_, i) => ({
+            id: `${prefix}-${i}`,
+            title: `${prefix}-${i}`,
+            content: "内容",
+            optimized_content: null,
+            category: null,
+            summary: null,
+            is_favorite: prefix === "收藏项",
+            created_at: "2026-01-01 00:00:00",
+            updated_at: "2026-01-01 00:00:00",
+            last_used_at: "2026-01-01 00:00:00",
+          }));
+
+        window.__TAURI_INTERNALS__ = {
+          invoke: async (cmd: string, args?: Record<string, unknown>) => {
+            if (cmd === "list_api_configs") return [];
+            if (cmd === "list_prompts") {
+              const favoriteOnly = args?.favoriteOnly === true;
+              const delay = favoriteOnly ? favoritesDelay : allDelay;
+              await new Promise((resolve) => window.setTimeout(resolve, delay));
+              return makePrompts(favoriteOnly ? "收藏项" : "全部项");
+            }
+            return null;
+          },
+          transformCallback: () => 1,
+          unregisterCallback: () => {},
+          runCallback: () => {},
+        };
+      },
+      { favoritesDelay: FAVORITES_DELAY_MS, allDelay: ALL_DELAY_MS }
+    );
+
+    await page.goto(BASE);
+
+    // 先点「收藏」（慢响应在飞），立刻点「全部 Prompt」（快响应先回）
+    await page.locator("nav button", { hasText: "收藏" }).click();
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+
+    await expect(page.locator("h1", { hasText: "全部 Prompt" })).toBeVisible();
+    await expect(page.getByText("全部项-0")).toBeVisible();
+
+    // 等到慢的旧响应确实回来了，列表仍须是「全部」而不是被覆盖成「收藏」
+    await page.waitForTimeout(FAVORITES_DELAY_MS + 300);
+
+    await expect(page.getByText("全部项-0")).toBeVisible();
+    await expect(page.getByText("收藏项-0")).toHaveCount(0);
+  });
+});
+
+/**
+ * 搜索状态隔离回归测试。
+ *
+ * `searchQuery` 曾经是全局 store 字段且没有任何清空入口，于是搜过一次之后，
+ * 再点收藏 / 最近使用 / 分类，看到的仍然是被劫持的搜索结果，标题却是新模式。
+ */
+test.describe("搜索与列表模式隔离", () => {
+  test("切换列表模式时清空上一轮的搜索词", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") {
+            return [
+              {
+                id: "all-list-0",
+                title: "全部项-0",
+                content: "内容",
+                optimized_content: null,
+                category: null,
+                summary: null,
+                is_favorite: false,
+                created_at: "2026-01-01 00:00:00",
+                updated_at: "2026-01-01 00:00:00",
+                last_used_at: "2026-01-01 00:00:00",
+              },
+            ];
+          }
+          if (cmd === "search_prompts") {
+            return [
+              {
+                id: "hit-0",
+                title: "搜索结果项-0",
+                summary: `命中 ${args?.query}`,
+                category: null,
+                tags: [],
+                updated_at: "2026-01-01 00:00:00",
+              },
+            ];
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+
+    // 在列表搜索框里搜一次
+    const searchBox = page.getByPlaceholder("搜索 Prompt 标题、内容、标签...");
+    await searchBox.fill("视频");
+    await expect(page.getByText("搜索结果项-0")).toBeVisible();
+    await expect(page.locator("h1", { hasText: "搜索结果" })).toBeVisible();
+
+    // 切到收藏：搜索必须被清空，列表回到正常的收藏视图
+    await page.locator("nav button", { hasText: "收藏" }).click();
+
+    await expect(page.locator("h1", { hasText: "收藏" })).toBeVisible();
+    await expect(searchBox).toHaveValue("");
+    await expect(page.getByText("搜索结果项-0")).toHaveCount(0);
+    await expect(page.getByText("全部项-0")).toBeVisible();
+  });
+});

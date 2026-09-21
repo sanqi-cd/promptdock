@@ -8,6 +8,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/components/ui/toast";
 import { cn, getErrorMessage } from "@/lib/utils";
 import { DeleteConfirmModal } from "@/components/DeleteConfirmModal";
+import { formatDate } from "@/lib/formatDate";
 
 const PROVIDERS: { value: string; label: string }[] = [
   { value: "openai", label: "OpenAI" },
@@ -235,7 +236,7 @@ export function SettingsPage() {
                     )}
                   </div>
                   <span className="text-[11px] text-slate-600 tabular-nums">
-                    {new Date(config.created_at).toLocaleDateString("zh-CN")}
+                    {formatDate(config.created_at)}
                   </span>
                 </div>
                 <CardDescription className="text-[12px] mt-0.5 text-slate-500">

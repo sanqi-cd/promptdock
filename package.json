@@ -9,7 +9,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test:e2e": "playwright install chromium && playwright test",
+    "test:e2e": "playwright install chromium webkit && playwright test",
     "audit:npm": "pnpm audit --audit-level moderate",
     "audit:rust": "cd src-tauri && cargo audit --stale",
     "audit:rust:strict": "cd src-tauri && cargo audit --deny warnings --stale",
