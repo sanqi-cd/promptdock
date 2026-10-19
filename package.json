@@ -1,7 +1,7 @@
 {
   "name": "promptdock",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local-first prompt manager for macOS.",
   "license": "MIT",
   "type": "module",

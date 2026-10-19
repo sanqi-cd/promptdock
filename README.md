@@ -19,7 +19,7 @@ PromptDock 是一款运行在 macOS 上的本地优先 Prompt 管理工具，适
 项目内置了一个预览版 macOS universal DMG：
 
 ```text
-release/PromptDock_0.1.0_universal_adhoc.dmg
+release/PromptDock_0.1.1_universal_adhoc.dmg
 ```
 
 该安装包支持 Apple Silicon 和 Intel Mac。当前版本使用 ad-hoc 签名，尚未使用 Apple Developer ID 签名和 notarization，因此首次打开时 macOS 可能会提示无法验证开发者。
