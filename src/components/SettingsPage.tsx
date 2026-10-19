@@ -49,6 +49,7 @@ const EMPTY_FORM: FormState = {
 
 export function SettingsPage() {
   const configs = useSettingsStore((s) => s.configs);
+  const configError = useSettingsStore((s) => s.error);
   const loadConfigs = useSettingsStore((s) => s.loadConfigs);
   const saveConfig = useSettingsStore((s) => s.saveConfig);
   const updateConfig = useSettingsStore((s) => s.updateConfig);
@@ -199,8 +200,28 @@ export function SettingsPage() {
           </Button>
         </div>
 
+        {/* 读取失败不能伪装成「暂无配置」 */}
+        {configError && (
+          <div
+            role="alert"
+            className="flex items-center gap-3 mb-4 px-3.5 py-2.5 rounded-[10px] border border-red-500/25 bg-red-500/[0.08]"
+          >
+            <span className="flex-1 min-w-0 text-[12px] text-red-200 break-words">
+              读取 API 配置失败：{configError}
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => loadConfigs()}
+              className="h-7 text-[11px] shrink-0"
+            >
+              重试
+            </Button>
+          </div>
+        )}
+
         {/* Config list */}
-        {configs.length === 0 && !showForm && (
+        {configs.length === 0 && !showForm && !configError && (
           <Card className="border-dashed border-white/[0.06] bg-white/[0.02]">
             <CardContent className="flex flex-col items-center justify-center py-16 gap-3">
               <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -344,7 +365,7 @@ export function SettingsPage() {
                   type="password"
                   value={form.apiKey}
                   onChange={(e) => setForm((f) => ({ ...f, apiKey: e.target.value }))}
-                  placeholder={editId ? "留空则不修改" : "sk-xxxx"}
+                  placeholder={editId ? "留空则不修改（修改主机后需重填）" : "sk-xxxx"}
                   className="h-8 text-[13px]"
                 />
                 <p className="text-[11px] text-slate-600">

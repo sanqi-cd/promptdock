@@ -42,7 +42,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
         title: r.title,
         content: r.summary || "",
         category: r.category,
-        is_favorite: false,
+        is_favorite: r.is_favorite,
         updated_at: r.updated_at,
       }))
     : mode === "recent"

@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { usePromptStore } from "@/stores/promptStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/components/ui/toast";
+import { DiscardConfirmModal } from "@/components/DiscardConfirmModal";
 import { getErrorMessage } from "@/lib/utils";
 
 interface RightPanelProps {
@@ -24,6 +26,7 @@ export function RightPanel({ context }: RightPanelProps) {
 
   const activeConfig = useSettingsStore((s) => s.activeConfig);
   const { addToast } = useToast();
+  const [showDiscardModal, setShowDiscardModal] = useState(false);
 
   const handleCopy = async () => {
     try {
@@ -54,6 +57,17 @@ export function RightPanel({ context }: RightPanelProps) {
   };
 
   const handleClear = () => {
+    // 内容写入不足 3s 时自动保存还没触发，直接新建会丢掉未保存的修改。
+    if (usePromptStore.getState().isDirty()) {
+      setShowDiscardModal(true);
+      return;
+    }
+    newPrompt();
+    addToast("已清空", "info");
+  };
+
+  const handleDiscardConfirm = () => {
+    setShowDiscardModal(false);
     newPrompt();
     addToast("已清空", "info");
   };
@@ -192,6 +206,12 @@ export function RightPanel({ context }: RightPanelProps) {
           </div>
         </div>
       </div>
+
+      <DiscardConfirmModal
+        open={showDiscardModal}
+        onConfirm={handleDiscardConfirm}
+        onCancel={() => setShowDiscardModal(false)}
+      />
     </aside>
   );
 }

@@ -20,6 +20,18 @@ interface PromptState {
   tags: string[];
   isFavorite: boolean;
 
+  /** 最近一次成功落库（或加载）的标题/正文快照，用于「新建前是否丢内容」的脏检查。 */
+  savedSnapshot: { title: string; content: string };
+
+  /**
+   * 每次切换编辑目标（新建 / 加载完成）时递增。
+   *
+   * 保存队列用它判断「这次保存的结果是否还属于当前编辑对象」：A 的保存请求
+   * 在用户切到 B 之后才返回时，不能把 A 的标题和快照写回 B 的状态。
+   * 润色面板也用它判断是否该清空上一条 Prompt 的结果。
+   */
+  editSession: number;
+
   prompts: Prompt[];
   searchResults: SearchResult[];
   searchQuery: string;
@@ -28,11 +40,22 @@ interface PromptState {
 
   isSaving: boolean;
   isPolishing: boolean;
+  /** 在途流式润色的请求 id，`cancelPolishStream` 按它通知后端。 */
+  polishRequestId: string | null;
   isClassifying: boolean;
   isSearching: boolean;
+  /**
+   * 后台读取失败的提示。只在**用户没有其他反馈渠道**的操作上设置：
+   * 列表 / 详情 / 搜索失败时界面会显示空白或陈旧内容，必须让用户知道原因。
+   * 删除、收藏这类用户主动触发、且调用方已经有 toast 的操作**不要**写这里，
+   * 否则 toast 消失后横幅还挂在那里。
+   */
   error: string | null;
+  /** 保存失败（含自动保存重试期间）的持久提示，成功后自动清除。 */
+  saveError: string | null;
 
   newPrompt: () => void;
+  isDirty: () => boolean;
   loadPrompt: (id: string) => Promise<void>;
   savePrompt: () => Promise<void>;
   deletePrompt: (id: string) => Promise<void>;
@@ -46,6 +69,8 @@ interface PromptState {
   search: (query: string) => Promise<void>;
   setSearchQuery: (query: string) => void;
   clearSearch: () => void;
+  clearError: () => void;
+  clearSaveError: () => void;
   setSelectedCategory: (category: string | null) => void;
   setFavoriteOnly: (fav: boolean) => void;
 
@@ -59,6 +84,7 @@ interface PromptState {
     sourceContent: string,
     onDelta: (delta: string) => void
   ) => Promise<string>;
+  cancelPolishStream: () => Promise<void>;
   autoClassify: () => Promise<ClassifyResult>;
   applyClassifyResult: (result: ClassifyResult) => Promise<void>;
 }
@@ -74,6 +100,20 @@ interface PolishStreamEvent {
 const beginListLoad = createLatestOnlyGuard();
 const beginPromptLoad = createLatestOnlyGuard();
 const beginSearch = createLatestOnlyGuard();
+const beginPolishStream = createLatestOnlyGuard();
+
+/**
+ * 保存串行化队列。自动保存（3s 防抖）和 ⌘S 可能同时发起：两个请求都读到
+ * `currentId === null` 就会各建一条重复记录。排队执行后，后一个保存读到的是
+ * 前一个写回的 currentId，自然走 update 而不是重复 create。
+ */
+let saveQueue: Promise<void> = Promise.resolve();
+
+/**
+ * 保存请求序号。`isSaving` 只允许最新一次保存在结束时复位，否则慢的旧保存
+ * 会在新保存进行中把 loading 关掉。
+ */
+let saveRequestSeq = 0;
 
 /**
  * 「处理要点」的结果缓存。
@@ -125,11 +165,19 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   favoriteOnly: false,
   isSaving: false,
   isPolishing: false,
+  polishRequestId: null,
   isClassifying: false,
   isSearching: false,
   error: null,
+  saveError: null,
+  savedSnapshot: { title: "", content: "" },
+  editSession: 0,
 
   newPrompt: () => {
+    // 先作废在途的 loadPrompt，否则它的迟到响应会在清空之后把编辑器写回旧 Prompt。
+    beginPromptLoad();
+    // 编辑目标变了，在途的流式润色一并取消。
+    void get().cancelPolishStream();
     set({
       currentId: null,
       title: "",
@@ -139,11 +187,37 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       summary: null,
       tags: [],
       isFavorite: false,
+      savedSnapshot: { title: "", content: "" },
+      // 用户已明确丢弃上一条内容，之前的保存失败提示不再有意义。
+      saveError: null,
+      // 让在途保存的结果失效，并通知润色面板清空上一条 Prompt 的结果。
+      editSession: get().editSession + 1,
     });
+  },
+
+  isDirty: () => {
+    const { title, content, savedSnapshot } = get();
+    return title !== savedSnapshot.title || content !== savedSnapshot.content;
   },
 
   loadPrompt: async (id: string) => {
     if (!hasTauriInvoke()) return;
+
+    // 切换编辑目标前先把还没到 3 秒防抖的修改落库。loadPrompt 会替换
+    // title/content，effect cleanup 随即清掉自动保存 timer，不 flush 就永久丢失。
+    // 保存失败时保持当前编辑器内容不变，避免用户以为已经切换成功。
+    if (get().isDirty()) {
+      try {
+        await get().savePrompt();
+      } catch {
+        // savePrompt 已把具体原因写进 saveError。留在当前 Prompt，
+        // 不要让用户以为已经切换成功。
+        return;
+      }
+    }
+
+    // 切换编辑目标时取消在途的流式润色，结果不该写进新打开的 Prompt。
+    void get().cancelPolishStream();
 
     // 快速连续打开两条 Prompt 时，慢的旧响应会把 currentId 写回旧 id，
     // 详情页因此永远等不到匹配的 id 而卡在 spinner。
@@ -165,6 +239,11 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         summary: prompt.summary,
         tags: tags.map((t) => t.name),
         isFavorite: prompt.is_favorite,
+        savedSnapshot: { title: prompt.title, content: prompt.content },
+        error: null,
+        saveError: null,
+        // 加载完成才算真正切换：失败时不 bump，编辑器仍属于上一条 Prompt。
+        editSession: get().editSession + 1,
       });
       await get().recordPromptUse(id);
     } catch (e) {
@@ -175,38 +254,78 @@ export const usePromptStore = create<PromptState>((set, get) => ({
     }
   },
 
-  savePrompt: async () => {
+  savePrompt: () => {
     if (!hasTauriInvoke()) {
       set({ error: "PromptDock desktop runtime is unavailable" });
-      return;
+      return Promise.resolve();
     }
 
-    const { currentId, title, content, optimizedContent } = get();
-    // 没有标题的记录在列表、搜索和详情里一律显示「未命名」，几乎找不回来。
-    // 自动保存和「自动分类」都会隐式落库，所以标题在这里统一兜底。
-    const effectiveTitle = title.trim() || deriveTitle(content);
+    // 记录这次保存属于哪个编辑会话。排队/网络等待期间用户可能新建或切到
+    // 另一条 Prompt，此时把旧结果写回状态会污染新 Prompt（标题、快照错位，
+    // 下一次自动保存再覆盖错记录）。
+    const session = get().editSession;
+    const seq = ++saveRequestSeq;
 
-    set({ isSaving: true });
-    try {
-      if (currentId) {
-        await invoke("update_prompt", {
-          id: currentId,
-          title: effectiveTitle,
-          content,
-          optimizedContent,
-        });
-        set({ title: effectiveTitle });
-      } else {
-        const prompt = await invoke<Prompt>("create_prompt", {
-          title: effectiveTitle,
-          content,
-          optimizedContent,
-        });
-        set({ currentId: prompt.id, title: effectiveTitle });
+    // 串行执行（原因见 saveQueue 声明处）。注意读 get() 的时机在执行时而不是
+    // 入队时：排队期间状态可能已被前一个保存或用户输入改变。
+    const run = saveQueue.then(async () => {
+      // 入队后编辑目标已切换：这次保存的数据不再属于当前会话，跳过。
+      if (session !== get().editSession) return;
+
+      const { currentId, title, content, optimizedContent } = get();
+      // 新建且完全空白时不落库：保存队列的迟到执行不应生成空记录。
+      if (!currentId && !title.trim() && !content.trim()) return;
+
+      // 没有标题的记录在列表、搜索和详情里一律显示「未命名」，几乎找不回来。
+      // 自动保存和「自动分类」都会隐式落库，所以标题在这里统一兜底。
+      const effectiveTitle = title.trim() || deriveTitle(content);
+
+      set({ isSaving: true });
+      try {
+        if (currentId) {
+          await invoke("update_prompt", {
+            id: currentId,
+            title: effectiveTitle,
+            content,
+            optimizedContent,
+          });
+          // 写入已经落在旧记录上是对的，但状态回写必须属于同一会话。
+          if (session !== get().editSession) return;
+          set({
+            title: effectiveTitle,
+            savedSnapshot: { title: effectiveTitle, content },
+            saveError: null,
+          });
+        } else {
+          const prompt = await invoke<Prompt>("create_prompt", {
+            title: effectiveTitle,
+            content,
+            optimizedContent,
+          });
+          // 创建期间用户已新建/切换：记录保留（内容没有丢），但不要把它
+          // 重新挂回当前编辑器。
+          if (session !== get().editSession) return;
+          set({
+            currentId: prompt.id,
+            title: effectiveTitle,
+            savedSnapshot: { title: effectiveTitle, content },
+            saveError: null,
+          });
+        }
+      } catch (e) {
+        if (session === get().editSession) {
+          set({ saveError: `保存失败：${getErrorMessage(e)}` });
+        }
+        throw e;
+      } finally {
+        // 只有最新一次保存有权复位，否则会在新保存进行中把 loading 关掉。
+        if (seq === saveRequestSeq) set({ isSaving: false });
       }
-    } finally {
-      set({ isSaving: false });
-    }
+    });
+    // 链上挂吞错分支，一次保存失败不会卡死后续所有保存；
+    // 错误本身仍通过 run 抛给调用方（toast / error）。
+    saveQueue = run.catch(() => {});
+    return run;
   },
 
   deletePrompt: async (id: string) => {
@@ -219,7 +338,8 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         get().newPrompt();
       }
     } catch (e) {
-      set({ error: getErrorMessage(e) });
+      // 调用方已经有 toast 了，这里只留日志，避免 toast 消失后横幅还挂着。
+      console.error("Failed to delete prompt:", getErrorMessage(e));
       throw e;
     }
   },
@@ -231,7 +351,8 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       await invoke("record_prompt_use", { id });
       await get().loadPrompts();
     } catch (e) {
-      set({ error: getErrorMessage(e) });
+      // 「最近使用」只是个统计，失败不该打断用户，也不值得弹横幅。
+      console.error("Failed to record prompt use:", getErrorMessage(e));
     }
   },
 
@@ -244,7 +365,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       const fav = await invoke<boolean>("toggle_favorite", { id: currentId });
       set({ isFavorite: fav });
     } catch (e) {
-      set({ error: getErrorMessage(e) });
+      console.error("Failed to toggle favorite:", getErrorMessage(e));
       throw e;
     }
   },
@@ -270,7 +391,8 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         favoriteOnly,
       });
       if (!isLatest()) return;
-      set({ prompts });
+      // 加载成功就清掉上一次的失败提示，用户不需要手动关。
+      set({ prompts, error: null });
     } catch (e) {
       if (!isLatest()) return;
       const msg = getErrorMessage(e);
@@ -291,7 +413,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
     try {
       const results = await invoke<SearchResult[]>("search_prompts", { query });
       if (!isLatest()) return;
-      set({ searchResults: results });
+      set({ searchResults: results, error: null });
     } catch (e) {
       if (!isLatest()) return;
       set({ error: getErrorMessage(e), searchResults: [] });
@@ -306,8 +428,11 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   clearSearch: () => {
     // 先作废在途的搜索响应，否则清空之后旧结果还会被写回来。
     beginSearch();
-    set({ searchQuery: "", searchResults: [], isSearching: false });
+    set({ searchQuery: "", searchResults: [], isSearching: false, error: null });
   },
+
+  clearError: () => set({ error: null }),
+  clearSaveError: () => set({ saveError: null }),
   setSelectedCategory: (category: string | null) => {
     set({ selectedCategory: category });
     get().loadPrompts();
@@ -348,10 +473,13 @@ export const usePromptStore = create<PromptState>((set, get) => ({
     sourceContent: string,
     onDelta: (delta: string) => void
   ) => {
-    set({ isPolishing: true });
+    // 流式竞态守卫：取消或发起新流之后，旧流的迟到 delta 和最终结果一律丢弃。
+    const isCurrent = beginPolishStream();
+    const requestId = crypto.randomUUID();
+    set({ isPolishing: true, polishRequestId: requestId });
     try {
       const channel = new Channel<PolishStreamEvent>((event) => {
-        if (event.type === "delta" && event.delta) {
+        if (event.type === "delta" && event.delta && isCurrent()) {
           onDelta(event.delta);
         }
       });
@@ -359,8 +487,12 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       const result = await invoke<string | null>("polish_prompt_stream", {
         content: sourceContent,
         mode,
+        requestId,
         onChunk: channel,
       });
+
+      // 已取消：结果丢弃（调用方的 runId 守卫同样会拦住，这里双保险）。
+      if (!isCurrent()) return "";
 
       if (typeof result === "string" && result.length > 0) {
         return result;
@@ -371,6 +503,12 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         mode,
       });
     } catch (e) {
+      // 后端取消是一种正常收尾，不是错误：返回空串让调用方静默结束。
+      // 即使前端守卫尚未作废（例如别处按 requestId 取消），也不能再回退到
+      // 非流式接口重发一次请求。
+      if (getErrorMessage(e) === POLISH_CANCELLED_MESSAGE) {
+        return "";
+      }
       if (isMissingStreamCommand(getErrorMessage(e))) {
         return await invoke<string>("polish_prompt", {
           content: sourceContent,
@@ -379,7 +517,28 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       }
       throw e;
     } finally {
-      set({ isPolishing: false });
+      // 只有没被取消/替换的那次流才有权复位状态，否则会把新流误判为已结束。
+      if (isCurrent()) {
+        set({ isPolishing: false, polishRequestId: null });
+      }
+    }
+  },
+
+  cancelPolishStream: async () => {
+    const { polishRequestId } = get();
+    if (!polishRequestId) return;
+
+    // 先作废守卫：之后到达的 delta 和最终结果都被 polishPromptStream 丢弃。
+    beginPolishStream();
+    set({ polishRequestId: null, isPolishing: false });
+
+    if (!hasTauriInvoke()) return;
+    try {
+      // 后端按 requestId 停流，幂等；取消不存在的 id 不报错。
+      await invoke("cancel_polish_stream", { requestId: polishRequestId });
+    } catch (e) {
+      // 取消是尽力而为，失败只留日志。
+      console.error("Failed to cancel polish stream:", getErrorMessage(e));
     }
   },
 
@@ -450,3 +609,6 @@ export function deriveTitle(content: string): string {
 function isMissingStreamCommand(message: string): boolean {
   return /command\s+polish_prompt_stream\s+not\s+found/i.test(message);
 }
+
+/** 与 `src-tauri/src/ai.rs` 的 `POLISH_CANCELLED` 保持一致。 */
+const POLISH_CANCELLED_MESSAGE = "POLISH_CANCELLED";
