@@ -38,6 +38,14 @@ release/SHA256SUMS.txt
 
 PromptDock 会把 Prompt、分类、设置和模型 API Key 存储在本地 SQLite 数据库中。API Key 只会发送到你自己配置的模型接口地址，但当前版本尚未对本地数据库中的 API Key 做额外加密。
 
+项目已采取的相关措施：
+
+- 数据库目录权限为 `0700`，数据库及 WAL/SHM 文件为 `0600`
+- 模型接口地址使用 URL 解析校验，拒绝 `https://api.openai.com@evil.example` 这类 userinfo 写法
+- API Key 与配置的 scheme/host/port 绑定：修改 Base URL 的主机时必须重新输入 Key
+- HTTP 客户端不跟随重定向，避免 Anthropic 的自定义 `x-api-key` 被跨主机转发
+- 错误响应体回显有长度上限
+
 建议使用单独创建的低额度 API Key，并在不再使用时及时撤销。
 
 ## 技术栈
@@ -105,8 +113,8 @@ pnpm tauri:build:dmg
 前端通过 `invoke()` 调用 Tauri 后端命令：
 
 - Prompt 管理：`create_prompt`、`update_prompt`、`delete_prompt`、`get_prompt`、`list_prompts`、`record_prompt_use`
-- Prompt 元数据：`toggle_favorite`、`get_prompt_tags`、`set_prompt_tags`、`update_prompt_meta`、`search_prompts`
-- AI 能力：`polish_prompt`、`polish_prompt_stream`、`analyze_polish_process`、`auto_classify`、`test_connection`
+- Prompt 元数据：`toggle_favorite`、`get_prompt_tags`、`set_prompt_tags`、`search_prompts`
+- AI 能力：`polish_prompt`、`polish_prompt_stream`（含 `requestId` 参数）、`cancel_polish_stream`（按 `requestId` 取消流式润色，幂等）、`analyze_polish_process`、`auto_classify`、`test_connection`
 - API 配置：`list_api_configs`、`get_active_config`、`save_api_config`、`update_api_config`、`delete_api_config`、`activate_api_config`
 
 ## 许可证
