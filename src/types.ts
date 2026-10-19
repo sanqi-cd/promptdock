@@ -23,6 +23,7 @@ export interface SearchResult {
   category: string | null;
   tags: string[];
   updated_at: string;
+  is_favorite: boolean;
 }
 
 export interface ClassifyResult {

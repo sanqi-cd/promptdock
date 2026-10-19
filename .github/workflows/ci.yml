@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 最小权限：CI 只需要读仓库，不产出 release/PR。
+permissions:
+  contents: read
+
+# 同一分支上的旧运行会被新提交取消，避免堆积。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 桌面端只发布 macOS，所以两个 job 都跑在 macOS 上：与真实目标平台一致，
+  # 也省掉 Linux 上那套 webkit2gtk / libsoup 系统依赖。
+  rust:
+    name: Rust（测试 + clippy）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo fmt
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      # cargo-audit 默认在发现漏洞时以非零退出；未维护/unsound 只告警。
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file src-tauri/Cargo.lock
+
+  frontend:
+    name: 前端（类型检查 + 构建 + E2E）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # 版本取自 package.json 的 packageManager 字段。
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 依赖审计
+        run: pnpm audit --audit-level high
+
+      - name: 类型检查
+        run: pnpm exec tsc --noEmit
+
+      - name: 构建
+        run: pnpm build
+
+      - name: 安装 Playwright 浏览器
+        run: pnpm exec playwright install --with-deps chromium webkit
+
+      - name: E2E（chromium + webkit）
+        run: pnpm exec playwright test
+
+      # 失败时把报告和 trace 带出来，否则线上挂了完全无从查起。
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

@@ -7,6 +7,8 @@ interface SettingsState {
   configs: ApiConfig[];
   activeConfig: ApiConfig | null;
   isLoaded: boolean;
+  /** 读取配置失败的原因。失败时 configs 为空，界面不能把它当成「没有配置」。 */
+  error: string | null;
 
   loadConfigs: () => Promise<void>;
   saveConfig: (
@@ -33,20 +35,24 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   configs: [],
   activeConfig: null,
   isLoaded: false,
+  error: null,
 
   loadConfigs: async () => {
     if (!hasTauriInvoke()) {
-      set({ configs: [], activeConfig: null, isLoaded: true });
+      set({ configs: [], activeConfig: null, isLoaded: true, error: null });
       return;
     }
 
     try {
       const configs = await invoke<ApiConfig[]>("list_api_configs");
       const active = configs.find((c) => c.is_active) || null;
-      set({ configs, activeConfig: active, isLoaded: true });
+      set({ configs, activeConfig: active, isLoaded: true, error: null });
     } catch (e) {
-      console.error("Failed to load API configs:", getErrorMessage(e));
-      set({ isLoaded: true });
+      const msg = getErrorMessage(e);
+      console.error("Failed to load API configs:", msg);
+      // 保留错误原因：否则设置页会显示「暂无 API 配置」、编辑器静默隐藏润色区，
+      // 用户会把读取失败误判成真的没有配置。
+      set({ isLoaded: true, error: msg });
     }
   },
 

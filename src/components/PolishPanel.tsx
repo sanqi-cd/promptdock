@@ -5,6 +5,7 @@ import { usePromptStore } from "@/stores/promptStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/components/ui/toast";
 import { cn, getErrorMessage } from "@/lib/utils";
+import { isOverlayOpen } from "@/lib/overlay";
 import type { PolishMode, PolishProcessStep } from "@/types";
 
 const POLISH_MODES: { value: PolishMode; label: string; desc: string; icon: string }[] = [
@@ -32,12 +33,55 @@ export function PolishPanel() {
   const polishRunIdRef = useRef(0);
 
   const content = usePromptStore((s) => s.content);
+  const editSession = usePromptStore((s) => s.editSession);
   const isPolishing = usePromptStore((s) => s.isPolishing);
   const analyzePolishProcess = usePromptStore((s) => s.analyzePolishProcess);
   const polishPromptStream = usePromptStore((s) => s.polishPromptStream);
+  const cancelPolishStream = usePromptStore((s) => s.cancelPolishStream);
   const activeConfig = useSettingsStore((s) => s.activeConfig);
   const { addToast } = useToast();
   const isProcessing = isAnalyzingProcess || isPolishing;
+
+  // 切到另一条 Prompt 时，上一条的润色结果必须作废：编辑器组件不会卸载，
+  // 否则「替换原文」会把 A 的文本写进 B。保存新建 Prompt 不会 bump editSession，
+  // 所以润色完成后的自动落库不会误清刚生成的结果。
+  const lastEditSessionRef = useRef(editSession);
+  useEffect(() => {
+    if (lastEditSessionRef.current === editSession) return;
+    lastEditSessionRef.current = editSession;
+    setResult(null);
+    setProcessSteps([]);
+    setProcessError(null);
+    setIsAnalyzingProcess(false);
+  }, [editSession]);
+
+  // 卸载（切换视图）时作废在途运行：迟到的 delta 不再 setState，后端也收到取消。
+  useEffect(() => {
+    return () => {
+      polishRunIdRef.current += 1;
+      void usePromptStore.getState().cancelPolishStream();
+    };
+  }, []);
+
+  // ⌘↵ 触发润色（按钮文案一直这么承诺，但此前没有实现）。
+  // 监听挂在本面板 —— 它只在工作台渲染，天然限定在编辑器上下文；
+  // 用 ref 取最新的 handlePolish，避免每次渲染都重挂监听。
+  const handlePolishRef = useRef<() => Promise<void>>(async () => {});
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        // 弹窗打开时事件仍会冒泡到 window：搜索/删除确认中按 ⌘↵
+        // 不该发起一次真实（计费）的润色调用。
+        if (isOverlayOpen()) return;
+        // 润色进行中不允许重入（按钮此时是 disabled 的，快捷键要一致）。
+        if (usePromptStore.getState().isPolishing) return;
+        void handlePolishRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   useEffect(() => {
     if (!isProcessing || processSteps.length === 0) {
@@ -71,10 +115,10 @@ export function PolishPanel() {
     setProcessError(null);
 
     let processTimer: number | undefined;
+    const runId = polishRunIdRef.current + 1;
+    polishRunIdRef.current = runId;
+    const isCurrentRun = () => polishRunIdRef.current === runId;
     try {
-      const runId = polishRunIdRef.current + 1;
-      polishRunIdRef.current = runId;
-      const isCurrentRun = () => polishRunIdRef.current === runId;
       let streamedContent = "";
       processTimer = window.setTimeout(() => {
         if (!isCurrentRun() || streamedContent.length > 0) {
@@ -111,6 +155,13 @@ export function PolishPanel() {
       if (!isCurrentRun()) {
         return;
       }
+      // 空串 = 外部取消（新建 / 切换 Prompt 时 store 丢弃结果并返回 ""）。
+      // 后端对空结果会报错，所以正常润色不可能返回空串。静默收尾，不弹 toast。
+      if (optimized === "") {
+        polishRunIdRef.current += 1;
+        setIsAnalyzingProcess(false);
+        return;
+      }
       setResult(optimized);
       setIsAnalyzingProcess(false);
       polishRunIdRef.current = runId + 1;
@@ -121,11 +172,25 @@ export function PolishPanel() {
       if (processTimer) {
         window.clearTimeout(processTimer);
       }
+      // 已取消或已有新一次润色：静默收尾，不弹错误打扰。
+      if (!isCurrentRun()) {
+        return;
+      }
       setIsAnalyzingProcess(false);
       polishRunIdRef.current += 1;
       addToast(getErrorMessage(e), "error");
     }
   };
+
+  const handleCancelPolish = () => {
+    // 先作废面板守卫，迟到的 delta / 最终结果不再进 state；再通知后端停流。
+    polishRunIdRef.current += 1;
+    setIsAnalyzingProcess(false);
+    void cancelPolishStream();
+  };
+
+  // 每次渲染同步最新闭包给 ⌘↵ 监听（ref 声明在上方 hooks 区）。
+  handlePolishRef.current = handlePolish;
 
   const handleApply = () => {
     if (result) {
@@ -213,6 +278,16 @@ export function PolishPanel() {
         <span className="mr-1.5">✨</span>
         {isProcessing ? "AI 润色中..." : "开始润色（⌘↵）"}
       </Button>
+
+      {isPolishing && (
+        <Button
+          variant="outline"
+          onClick={handleCancelPolish}
+          className="w-full h-9 rounded-[10px] border-white/[0.08] text-[12px] font-medium text-slate-300 hover:bg-white/[0.04]"
+        >
+          取消
+        </Button>
+      )}
 
       {isProcessing && !result && (isAnalyzingProcess || processSteps.length > 0 || processError) && (
         <PolishProgress

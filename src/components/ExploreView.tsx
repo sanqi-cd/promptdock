@@ -1,6 +1,7 @@
 import { usePromptStore } from "@/stores/promptStore";
 import { CATEGORIES } from "@/components/CategoryTags";
 import { CategoryIcon } from "@/lib/categoryIcons";
+import { formatDate } from "@/lib/formatDate";
 
 interface ExploreViewProps {
   onSelectPrompt: (id: string) => void;
@@ -101,7 +102,7 @@ export function ExploreView({ onSelectPrompt, onSelectCategory }: ExploreViewPro
                       </span>
                     )}
                     <span className="text-[11px] text-slate-600">
-                      {new Date(p.updated_at).toLocaleDateString("zh-CN")}
+                      {formatDate(p.updated_at)}
                     </span>
                   </div>
                   <p className="text-[12px] text-slate-500 line-clamp-2 mt-0.5">

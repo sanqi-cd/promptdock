@@ -19,6 +19,7 @@ export function PromptDetailView({ promptId, onBack, onEdit }: PromptDetailViewP
   const summary = usePromptStore((s) => s.summary);
   const tags = usePromptStore((s) => s.tags);
   const isFavorite = usePromptStore((s) => s.isFavorite);
+  const loadError = usePromptStore((s) => s.error);
   const loadPrompt = usePromptStore((s) => s.loadPrompt);
   const toggleFavorite = usePromptStore((s) => s.toggleFavorite);
   const deletePrompt = usePromptStore((s) => s.deletePrompt);
@@ -67,6 +68,35 @@ export function PromptDetailView({ promptId, onBack, onEdit }: PromptDetailViewP
   };
 
   if (currentId !== promptId) {
+    // 读取失败时 currentId 永远不会变成目标 id。继续转圈会让用户以为应用卡死，
+    // 给出原因和「返回列表」比无限 spinner 有用。
+    if (loadError) {
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6">
+          <p className="text-[13px] text-slate-300">加载 Prompt 失败</p>
+          <p className="text-[12px] text-red-300/90 max-w-md text-center break-words">
+            {loadError}
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => loadPrompt(promptId)}
+              className="h-8 px-4 rounded-lg text-[12px] text-slate-200 bg-white/[0.06] border border-white/[0.08] hover:bg-white/[0.08]"
+            >
+              重试
+            </button>
+            <button
+              type="button"
+              onClick={onBack}
+              className="h-8 px-4 rounded-lg text-[12px] text-slate-400 hover:text-slate-200"
+            >
+              返回列表
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex-1 flex items-center justify-center">
         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"

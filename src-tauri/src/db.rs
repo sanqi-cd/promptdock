@@ -5,20 +5,77 @@ use tauri::Manager;
 
 const DB_FILENAME: &str = "promptdock.db";
 
-pub fn get_db_path(app_handle: &tauri::AppHandle) -> PathBuf {
+/// 当前 schema 版本，存于 `PRAGMA user_version`。
+///
+/// 1 = 已确保 FTS 索引与 `prompts` 表一致。
+const SCHEMA_VERSION: i64 = 1;
+
+pub fn get_db_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // 失败时不能回退到当前目录：那可能把含明文 Key 的数据库写进下载目录、
+    // 同步盘或仓库目录。宁可直接报错退出。
     let app_dir = app_handle
         .path()
         .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    if let Err(e) = fs::create_dir_all(&app_dir) {
-        eprintln!("Failed to create app data directory: {}", e);
+        .map_err(|e| format!("无法定位应用数据目录: {}", e))?;
+
+    fs::create_dir_all(&app_dir)
+        .map_err(|e| format!("无法创建应用数据目录 {}: {}", app_dir.display(), e))?;
+
+    // 数据库里有明文 API Key，目录只允许当前用户访问。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("无法设置应用数据目录权限: {}", e))?;
     }
-    app_dir.join(DB_FILENAME)
+
+    Ok(app_dir.join(DB_FILENAME))
 }
 
 pub fn init_db(db_path: &Path) -> SqliteResult<Connection> {
+    restrict_db_permissions(db_path);
     let conn = Connection::open(db_path)?;
+    // A brand-new database file was created by the open above with umask
+    // permissions; tighten it before the first write creates the WAL sidecar
+    // (SQLite gives the sidecars the database file's mode).
+    restrict_db_permissions(db_path);
+    // Without a busy timeout, any concurrent writer (a second app instance or an
+    // external sqlite tool) makes the next write fail immediately with
+    // "database is locked". Wait briefly instead.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
 
+/// Keeps the database and its WAL sidecars readable only by the current user.
+///
+/// SQLite creates `-wal` / `-shm` with the database file's permissions, so the
+/// chmod has to run before opening the connection (and cover sidecars created
+/// by a previous run).
+fn restrict_db_permissions(db_path: &Path) {
+    #[cfg(not(unix))]
+    let _ = db_path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::Permissions::from_mode(0o600);
+        for path in [
+            db_path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ] {
+            if path.exists() {
+                let _ = fs::set_permissions(&path, mode.clone());
+            }
+        }
+    }
+}
+
+/// Creates tables, indexes and FTS5 triggers on an already-open connection.
+///
+/// Split out of [`init_db`] so tests can exercise the real schema against an
+/// in-memory database instead of re-declaring the DDL.
+pub fn init_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
 
@@ -61,8 +118,8 @@ pub fn init_db(db_path: &Path) -> SqliteResult<Connection> {
         );",
     )?;
 
-    ensure_column(&conn, "prompts", "last_used_at", "TEXT")?;
-    ensure_column(&conn, "api_configs", "api_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "prompts", "last_used_at", "TEXT")?;
+    ensure_column(conn, "api_configs", "api_key", "TEXT NOT NULL DEFAULT ''")?;
     conn.execute(
         "UPDATE prompts SET last_used_at = updated_at WHERE last_used_at IS NULL",
         [],
@@ -98,7 +155,26 @@ pub fn init_db(db_path: &Path) -> SqliteResult<Connection> {
         END;",
     )?;
 
-    Ok(conn)
+    run_migrations(conn)?;
+
+    Ok(())
+}
+
+/// 一次性数据迁移，由 `PRAGMA user_version` 驱动。
+fn run_migrations(conn: &Connection) -> SqliteResult<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // FTS 索引对**既有行**是空的：外部内容表的索引不会自动回填，上面那些
+    // `CREATE TRIGGER IF NOT EXISTS` 也只对之后的写入生效。老库（prompts 表先于
+    // FTS 存在）因此会静默搜索不到任何历史数据，必须重建一次。
+    conn.execute_batch("INSERT INTO prompts_fts(prompts_fts) VALUES('rebuild');")?;
+
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+
+    Ok(())
 }
 
 fn ensure_column(
@@ -158,5 +234,89 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// 模拟「prompts 表先于 FTS 存在」的老库：先只建 prompts 并写入数据，
+    /// 再跑 init_schema。
+    fn legacy_db_without_fts() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE prompts (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                optimized_content TEXT,
+                category TEXT,
+                summary TEXT,
+                is_favorite INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            );
+            INSERT INTO prompts (id, title, content)
+            VALUES ('legacy', '旧 Prompt', 'write a python script');",
+        )
+        .expect("create legacy schema");
+        conn
+    }
+
+    #[test]
+    fn init_schema_rebuilds_a_missing_fts_index() {
+        // 回归测试：`CREATE VIRTUAL TABLE IF NOT EXISTS` 对老库只会建出一张空索引，
+        // 且触发器只对**之后**的写入生效 —— 老数据全部搜不到，而且没有任何提示。
+        let conn = legacy_db_without_fts();
+
+        init_schema(&conn).expect("init schema");
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompts_fts WHERE prompts_fts MATCH '\"python\"*'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query fts");
+        assert_eq!(hits, 1, "升级后老数据必须能被 FTS 搜到");
+    }
+
+    #[test]
+    fn init_schema_records_the_schema_version_so_rebuild_runs_once() {
+        let conn = legacy_db_without_fts();
+
+        init_schema(&conn).expect("first init");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read user_version");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // 再跑一次不应报错（幂等），也不应重复清空索引。
+        init_schema(&conn).expect("second init");
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompts_fts WHERE prompts_fts MATCH '\"python\"*'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query fts");
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn init_schema_keeps_new_writes_indexed() {
+        let conn = legacy_db_without_fts();
+        init_schema(&conn).expect("init schema");
+
+        conn.execute(
+            "INSERT INTO prompts (id, title, content) VALUES ('new', '新 Prompt', 'a golang service')",
+            [],
+        )
+        .expect("insert");
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM prompts_fts WHERE prompts_fts MATCH '\"golang\"*'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query fts");
+        assert_eq!(hits, 1, "触发器应继续同步新写入");
     }
 }

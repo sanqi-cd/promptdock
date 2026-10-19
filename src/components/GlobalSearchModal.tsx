@@ -12,18 +12,25 @@ export function GlobalSearchModal({ open, onClose, onSelect }: GlobalSearchModal
   const searchResults = usePromptStore((s) => s.searchResults);
   const isSearching = usePromptStore((s) => s.isSearching);
   const search = usePromptStore((s) => s.search);
-  const setSearchQuery = usePromptStore((s) => s.setSearchQuery);
+  const clearSearch = usePromptStore((s) => s.clearSearch);
   const [inputValue, setInputValue] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
+  const searchTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     if (!open) {
       setInputValue("");
-      setSearchQuery("");
+      // 关闭时不能只清 searchQuery：旧结果和仍在飞的请求都会留下来，
+      // 下次打开会看到与输入框不匹配的「幽灵结果」。
+      clearSearch();
       setSelectedIndex(0);
     }
-  }, [open, setSearchQuery]);
+  }, [open, clearSearch]);
+
+  useEffect(() => {
+    return () => window.clearTimeout(searchTimerRef.current);
+  }, []);
 
   useEffect(() => {
     setSelectedIndex(0);
@@ -51,7 +58,8 @@ export function GlobalSearchModal({ open, onClose, onSelect }: GlobalSearchModal
           break;
         case "Enter":
           e.preventDefault();
-          if (searchResults[selectedIndex]) {
+          // 输入为空时列表只是占位，不能选中上一轮的残留结果。
+          if (inputValue.trim() && searchResults[selectedIndex]) {
             onSelect(searchResults[selectedIndex].id);
             onClose();
           }
@@ -69,23 +77,33 @@ export function GlobalSearchModal({ open, onClose, onSelect }: GlobalSearchModal
           break;
       }
     },
-    [searchResults, selectedIndex, onSelect, onClose]
+    [searchResults, selectedIndex, inputValue, onSelect, onClose]
   );
 
   const handleInput = useCallback(
     (value: string) => {
       setInputValue(value);
-      if (value.trim()) {
-        search(value);
+      window.clearTimeout(searchTimerRef.current);
+
+      if (!value.trim()) {
+        // 立即作废在途请求并清空结果，避免清空输入后仍显示旧结果。
+        clearSearch();
+        return;
       }
+
+      // 每个按键都发起一次查询会在中文 LIKE 全表扫描时放大开销。
+      searchTimerRef.current = window.setTimeout(() => search(value), 200);
     },
-    [search]
+    [search, clearSearch]
   );
 
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]">
+    <div
+      data-modal-open="true"
+      className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+    >
       {/* Backdrop */}
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
 
@@ -138,7 +156,7 @@ export function GlobalSearchModal({ open, onClose, onSelect }: GlobalSearchModal
               <p className="text-[13px] text-slate-600">输入关键词开始搜索</p>
             </div>
           )}
-          {searchResults.map((r, i) => (
+          {inputValue.trim() && searchResults.map((r, i) => (
             <button
               key={r.id}
               role="option"

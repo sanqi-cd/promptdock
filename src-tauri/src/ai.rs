@@ -1,12 +1,18 @@
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use uuid::Uuid;
 
 use crate::api_configs;
 use crate::commands::DbState;
+use crate::polish_prompts::{
+    polish_mode_label, polish_system_prompt, CLASSIFY_SYSTEM_PROMPT, POLISH_PROCESS_PROMPT,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClassifyResult {
@@ -29,6 +35,74 @@ pub enum PolishStreamEvent {
     Done { content: String },
 }
 
+/// Error string returned when the user cancels an in-flight polish.
+///
+/// Kept ASCII so the frontend can match it exactly; it never reaches the UI
+/// (the store converts it to an empty result).
+pub(crate) const POLISH_CANCELLED: &str = "POLISH_CANCELLED";
+
+/// Cooperative cancellation for one in-flight polish request.
+///
+/// An `AtomicBool` alone is only observable between chunks, so cancelling
+/// while the server is silent still waits for the 120s idle-read timeout.
+/// `notify_one` wakes a pending `send()` / `stream.next()` immediately.
+#[derive(Default)]
+struct CancelToken {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        // `notify_one` stores a permit when no waiter is registered, so a
+        // cancel that lands between the flag check and `notified()` is not lost.
+        self.notify.notify_one();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once cancellation is requested. Cancel-safe in `tokio::select!`.
+    async fn wait_cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+/// Cancellation tokens for in-flight streaming polish requests, keyed by the
+/// `request_id` the frontend passes to `polish_prompt_stream`.
+#[derive(Default)]
+pub struct PolishCancelState(Mutex<HashMap<String, Arc<CancelToken>>>);
+
+impl PolishCancelState {
+    fn register(&self, request_id: &str) -> Result<Arc<CancelToken>, String> {
+        let token = Arc::new(CancelToken::default());
+        self.0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(request_id.to_string(), token.clone());
+        Ok(token)
+    }
+
+    /// Signals cancellation if the request is still in flight. Unknown ids are
+    /// a no-op, which keeps cancellation idempotent.
+    fn cancel(&self, request_id: &str) -> Result<(), String> {
+        if let Some(token) = self.0.lock().map_err(|e| e.to_string())?.get(request_id) {
+            token.cancel();
+        }
+        Ok(())
+    }
+
+    fn unregister(&self, request_id: &str) -> Result<(), String> {
+        self.0.lock().map_err(|e| e.to_string())?.remove(request_id);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiSettings {
     pub config_id: String,
@@ -38,11 +112,116 @@ pub struct ApiSettings {
     pub model: String,
 }
 
+/// Anthropic's Messages API rejects requests that omit this header with
+/// `400 invalid_request_error: "anthropic-version: header is required"`.
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
+/// Anthropic requires an explicit output cap; OpenAI-compatible APIs do not.
+const MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// Ceiling for a whole request. Deliberately generous: a non-streaming polish
+/// against a slow model can legitimately take minutes.
+const REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Abort when the server goes quiet for this long. This — not the total timeout
+/// — is what protects against a stalled connection, so it does not cut off a
+/// long streaming response that keeps producing tokens.
+const READ_TIMEOUT_SECS: u64 = 120;
+const CONNECT_TIMEOUT_SECS: u64 = 15;
+
+// Compile-time guard on the timeout budget. This was previously a single 60s
+// total timeout, which silently aborted any streaming polish that had not
+// finished within a minute. Keep these generous.
+const _: () = {
+    assert!(
+        REQUEST_TIMEOUT_SECS >= 300,
+        "total timeout must be wide enough for long responses"
+    );
+    assert!(
+        READ_TIMEOUT_SECS > 60,
+        "idle-read timeout must be wider than the old 60s cap"
+    );
+    assert!(CONNECT_TIMEOUT_SECS < READ_TIMEOUT_SECS);
+};
+
+/// Anthropic needs its own endpoint shape, auth scheme and request body, so the
+/// provider check lives in one place.
+fn is_anthropic_provider(provider: &str) -> bool {
+    provider.to_lowercase().contains("anthropic")
+}
+
+/// 进程级共享的 HTTP 客户端。
+///
+/// `reqwest::Client` 内部持有连接池，克隆很廉价；每次请求都新建一个会丢掉连接复用，
+/// 让每一次 AI 调用重新走一遍 TCP + TLS 握手。
+static HTTP_CLIENT: std::sync::OnceLock<Result<Client, String>> = std::sync::OnceLock::new();
+
+/// 流式请求专用客户端：不设置覆盖整个响应体的总超时。
+///
+/// reqwest 的 `timeout` 是「从开始连接直到响应体读完」，会把超过 300 秒的长流
+/// 从中间掐断。流式请求只有 connect + read(idle) 超时，只要模型持续输出就不会
+/// 被误杀；连接静默 120 秒仍会被 read_timeout 终止。
+static STREAM_HTTP_CLIENT: std::sync::OnceLock<Result<Client, String>> = std::sync::OnceLock::new();
+
+/// 返回共享客户端（首次调用时创建）。
 fn build_client() -> Result<Client, String> {
+    HTTP_CLIENT.get_or_init(create_client).clone()
+}
+
+/// 返回流式请求专用客户端（首次调用时创建）。
+fn build_stream_client() -> Result<Client, String> {
+    STREAM_HTTP_CLIENT.get_or_init(create_stream_client).clone()
+}
+
+fn configured_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
+        // 不跟随重定向。reqwest 跨主机重定向时只剥离 Authorization / Cookie，
+        // 自定义的 x-api-key（Anthropic）会被原样转发到重定向目标。
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+fn create_client() -> Result<Client, String> {
+    configured_client_builder()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
+fn create_stream_client() -> Result<Client, String> {
+    configured_client_builder()
+        .build()
+        .map_err(|e| format!("Failed to create streaming HTTP client: {}", e))
+}
+
+/// Caps how much of an upstream error body is echoed back to the webview.
+/// Without a cap, an arbitrary endpoint (including a local service reached via
+/// `test_connection`) could stream a large response into the UI.
+const MAX_ERROR_BODY_CHARS: usize = 500;
+
+fn truncate_error_body(body: &str) -> String {
+    let mut chars = body.chars();
+    let prefix: String = chars.by_ref().take(MAX_ERROR_BODY_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+/// Applies provider-appropriate authentication headers.
+fn apply_auth_headers(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    if is_anthropic_provider(provider) {
+        request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_API_VERSION)
+    } else {
+        request.header("Authorization", format!("Bearer {}", api_key))
+    }
 }
 
 fn parse_openai_response(response: &Value) -> String {
@@ -71,12 +250,12 @@ async fn chat_completion(
 
     let client = build_client()?;
 
-    let is_anthropic = settings.provider.to_lowercase().contains("anthropic");
+    let is_anthropic = is_anthropic_provider(&settings.provider);
 
     let request_body = if is_anthropic {
         serde_json::json!({
             "model": settings.model,
-            "max_tokens": 4096,
+            "max_tokens": MAX_OUTPUT_TOKENS,
             "system": system_prompt,
             "messages": [
                 {"role": "user", "content": user_message}
@@ -101,15 +280,13 @@ async fn chat_completion(
         )
     };
 
-    let mut req = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json");
-
-    if is_anthropic {
-        req = req.header("x-api-key", api_key);
-    } else {
-        req = req.header("Authorization", format!("Bearer {}", api_key));
-    }
+    let req = apply_auth_headers(
+        client
+            .post(&endpoint)
+            .header("Content-Type", "application/json"),
+        &settings.provider,
+        api_key,
+    );
 
     let response = req.json(&request_body).send().await.map_err(|e| {
         if e.is_timeout() {
@@ -124,7 +301,10 @@ async fn chat_completion(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("API 请求失败 ({status}): {body}"));
+        return Err(format!(
+            "API 请求失败 ({status}): {}",
+            truncate_error_body(&body)
+        ));
     }
 
     let json: Value = response.json().await.map_err(|e| e.to_string())?;
@@ -142,19 +322,204 @@ async fn chat_completion(
     }
 }
 
-fn parse_openai_stream_delta(json: &Value) -> Option<String> {
-    json["choices"][0]["delta"]["content"]
-        .as_str()
-        .map(str::to_string)
-}
-
-fn emit_polish_delta(
-    on_chunk: &Channel<PolishStreamEvent>,
-    delta: String,
-) -> Result<(), String> {
+fn emit_polish_delta(on_chunk: &Channel<PolishStreamEvent>, delta: String) -> Result<(), String> {
     on_chunk
         .send(PolishStreamEvent::Delta { delta })
         .map_err(|e| format!("流式结果发送失败: {}", e))
+}
+
+/// OpenAI-compatible servers end the SSE stream with this sentinel. Anthropic
+/// does not — its stream just stops after `message_stop`.
+const STREAM_DONE_MARKER: &str = "[DONE]";
+
+/// One decoded SSE payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamEvent {
+    /// Text to append to the response.
+    Delta(String),
+    /// The stream signalled completion; stop reading.
+    Done,
+    /// Nothing to append (lifecycle event, keep-alive, unparseable noise).
+    Ignore,
+}
+
+/// Accumulates raw SSE bytes and yields complete lines.
+///
+/// Chunk boundaries fall anywhere, so a line can be split across two chunks and
+/// has to be held until its newline arrives. Buffering **bytes** — not decoded
+/// text — is what keeps multi-byte UTF-8 characters (e.g. 3-byte Chinese)
+/// intact when they straddle a chunk boundary: decoding happens only on
+/// complete lines, and a line boundary never splits a character.
+/// Upper bound for a single un-terminated SSE line. A malicious or broken
+/// endpoint (base_url is user-controlled) must not be able to grow the buffer
+/// without bound by never sending a newline.
+const SSE_LINE_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct SseBuffer {
+    pending: Vec<u8>,
+}
+
+impl SseBuffer {
+    /// Appends `chunk` and returns every line completed by it.
+    ///
+    /// Passing `b"\n"` flushes whatever is still buffered, which is how a final
+    /// line that arrived without a trailing newline gets processed.
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        self.pending.extend_from_slice(chunk);
+
+        let mut lines = Vec::new();
+        while let Some(index) = self.pending.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=index).collect();
+            line.pop(); // drop the '\n'
+            lines.push(decode_sse_line(&line));
+        }
+
+        if self.pending.len() > SSE_LINE_MAX_BYTES {
+            return Err("流式响应单行过长，已中止".to_string());
+        }
+
+        Ok(lines)
+    }
+}
+
+/// Decodes one complete SSE line. The strict path should always succeed — a
+/// line boundary cannot split a multi-byte character — so lossy decoding is
+/// only a safety net for a peer that sends genuinely invalid bytes.
+fn decode_sse_line(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.trim().to_string(),
+        Err(_) => String::from_utf8_lossy(bytes).trim().to_string(),
+    }
+}
+
+/// Decodes one SSE `data:` payload.
+///
+/// Unparseable payloads are [`StreamEvent::Ignore`] on purpose: a single
+/// keep-alive, gateway error page or non-standard event must not abort a stream
+/// that is otherwise delivering a perfectly good answer.
+fn classify_stream_payload(provider: &str, data: &str) -> StreamEvent {
+    let data = data.trim();
+    if data.is_empty() {
+        return StreamEvent::Ignore;
+    }
+    if data == STREAM_DONE_MARKER {
+        return StreamEvent::Done;
+    }
+
+    let Ok(json) = serde_json::from_str::<Value>(data) else {
+        return StreamEvent::Ignore;
+    };
+
+    if is_anthropic_provider(provider) {
+        // Anthropic tags every event with a `type`; only content_block_delta
+        // carries text.
+        if json["type"].as_str() != Some("content_block_delta") {
+            return StreamEvent::Ignore;
+        }
+        match json["delta"]["text"].as_str() {
+            Some(text) if !text.is_empty() => StreamEvent::Delta(text.to_string()),
+            _ => StreamEvent::Ignore,
+        }
+    } else {
+        match json["choices"][0]["delta"]["content"].as_str() {
+            Some(text) if !text.is_empty() => StreamEvent::Delta(text.to_string()),
+            _ => StreamEvent::Ignore,
+        }
+    }
+}
+
+/// Applies one SSE line to `content`, returning `true` when the stream is done.
+fn apply_stream_line<E>(
+    provider: &str,
+    line: &str,
+    content: &mut String,
+    emit: &mut E,
+) -> Result<bool, String>
+where
+    E: FnMut(String) -> Result<(), String>,
+{
+    // Comment lines (`: keep-alive`) and non-`data:` fields (`event:`, `id:`)
+    // carry no payload.
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(false);
+    };
+
+    match classify_stream_payload(provider, data) {
+        StreamEvent::Delta(delta) => {
+            content.push_str(&delta);
+            emit(delta)?;
+            Ok(false)
+        }
+        StreamEvent::Done => Ok(true),
+        StreamEvent::Ignore => Ok(false),
+    }
+}
+
+/// Reads SSE byte chunks to completion, forwarding each delta through `emit`
+/// and returning the accumulated content.
+///
+/// The loop stops when the provider signals done, the stream ends, or
+/// `cancelled` is signalled. Cancellation races against `stream.next()` so a
+/// silent upstream cannot keep the request alive until the read timeout.
+async fn consume_sse_stream<S, C, SE, E>(
+    provider: &str,
+    mut stream: S,
+    emit: &mut E,
+    cancelled: &CancelToken,
+) -> Result<String, String>
+where
+    S: Stream<Item = Result<C, SE>> + Unpin,
+    C: AsRef<[u8]>,
+    SE: std::fmt::Display,
+    E: FnMut(String) -> Result<(), String>,
+{
+    let mut buffer = SseBuffer::default();
+    let mut content = String::new();
+    let mut done = false;
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancelled.wait_cancelled() => {
+                return Err(POLISH_CANCELLED.to_string());
+            }
+            next = stream.next() => next,
+        };
+
+        let Some(chunk) = next else {
+            break;
+        };
+        let chunk = chunk.map_err(|e| format!("读取流式响应失败: {}", e))?;
+
+        for line in buffer.push(chunk.as_ref())? {
+            if apply_stream_line(provider, &line, &mut content, emit)? {
+                done = true;
+                break;
+            }
+        }
+
+        if done {
+            break;
+        }
+    }
+
+    // Flush a final line that arrived without a trailing newline.
+    if !done {
+        for line in buffer.push(b"\n")? {
+            if apply_stream_line(provider, &line, &mut content, emit)? {
+                break;
+            }
+        }
+    }
+
+    // A cancel that lands during the flush still wins: callers must not treat
+    // truncated content as a complete result.
+    if cancelled.is_cancelled() {
+        return Err(POLISH_CANCELLED.to_string());
+    }
+
+    Ok(content)
 }
 
 async fn chat_completion_stream(
@@ -162,100 +527,86 @@ async fn chat_completion_stream(
     system_prompt: &str,
     user_message: &str,
     on_chunk: Channel<PolishStreamEvent>,
+    cancelled: &CancelToken,
 ) -> Result<String, String> {
     let api_key = settings.api_key.trim();
     if api_key.is_empty() {
         return Err("未找到 API Key，请在设置中重新输入并保存该模型配置".to_string());
     }
 
-    let is_anthropic = settings.provider.to_lowercase().contains("anthropic");
-    if is_anthropic {
-        let content = chat_completion(settings, system_prompt, user_message).await?;
-        emit_polish_delta(&on_chunk, content.clone())?;
-        on_chunk
-            .send(PolishStreamEvent::Done {
-                content: content.clone(),
-            })
-            .map_err(|e| format!("流式结果发送失败: {}", e))?;
-        return Ok(content);
+    let is_anthropic = is_anthropic_provider(&settings.provider);
+
+    let request_body = if is_anthropic {
+        serde_json::json!({
+            "model": settings.model,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "system": system_prompt,
+            "stream": true,
+            "messages": [
+                {"role": "user", "content": user_message}
+            ]
+        })
+    } else {
+        serde_json::json!({
+            "model": settings.model,
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
+        })
+    };
+
+    let endpoint = if is_anthropic {
+        format!("{}/messages", settings.base_url.trim_end_matches('/'))
+    } else {
+        format!(
+            "{}/chat/completions",
+            settings.base_url.trim_end_matches('/')
+        )
+    };
+
+    let client = build_stream_client()?;
+    let request = apply_auth_headers(
+        client
+            .post(&endpoint)
+            .header("Content-Type", "application/json"),
+        &settings.provider,
+        api_key,
+    )
+    .json(&request_body);
+
+    // Race the request itself: cancelling before the response headers arrive
+    // should not wait for connect/read timeouts (15s / 120s).
+    let response = tokio::select! {
+        biased;
+        _ = cancelled.wait_cancelled() => {
+            return Err(POLISH_CANCELLED.to_string());
+        }
+        response = request.send() => response,
     }
-
-    let client = build_client()?;
-    let request_body = serde_json::json!({
-        "model": settings.model,
-        "stream": true,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ]
-    });
-    let endpoint = format!(
-        "{}/chat/completions",
-        settings.base_url.trim_end_matches('/')
-    );
-
-    let response = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "模型请求超时，请检查网络后重试".to_string()
-            } else if e.is_connect() {
-                "模型请求失败，请检查网络或 API 配置".to_string()
-            } else {
-                format!("模型请求失败，请检查网络或 API 配置: {}", e)
-            }
-        })?;
+    .map_err(|e| {
+        if e.is_timeout() {
+            "模型请求超时，请检查网络后重试".to_string()
+        } else if e.is_connect() {
+            "模型请求失败，请检查网络或 API 配置".to_string()
+        } else {
+            format!("模型请求失败，请检查网络或 API 配置: {}", e)
+        }
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("API 请求失败 ({status}): {body}"));
+        return Err(format!(
+            "API 请求失败 ({status}): {}",
+            truncate_error_body(&body)
+        ));
     }
 
-    let mut stream = response.bytes_stream();
-    let mut pending = String::new();
-    let mut content = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("读取流式响应失败: {}", e))?;
-        pending.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(newline_index) = pending.find('\n') {
-            let raw_line = pending[..newline_index].trim().to_string();
-            pending = pending[newline_index + 1..].to_string();
-
-            if raw_line.is_empty() || raw_line.starts_with(':') {
-                continue;
-            }
-
-            let Some(data) = raw_line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data == "[DONE]" {
-                on_chunk
-                    .send(PolishStreamEvent::Done {
-                        content: content.clone(),
-                    })
-                    .map_err(|e| format!("流式结果发送失败: {}", e))?;
-                return Ok(content);
-            }
-
-            let json: Value = serde_json::from_str(data)
-                .map_err(|e| format!("解析流式响应失败: {}", e))?;
-            if let Some(delta) = parse_openai_stream_delta(&json) {
-                if !delta.is_empty() {
-                    content.push_str(&delta);
-                    emit_polish_delta(&on_chunk, delta)?;
-                }
-            }
-        }
-    }
+    let stream = response.bytes_stream();
+    let mut emit = |delta: String| emit_polish_delta(&on_chunk, delta);
+    let content = consume_sse_stream(&settings.provider, stream, &mut emit, cancelled).await?;
 
     if content.is_empty() {
         Err("模型返回了空内容，请重试".to_string())
@@ -266,26 +617,6 @@ async fn chat_completion_stream(
             })
             .map_err(|e| format!("流式结果发送失败: {}", e))?;
         Ok(content)
-    }
-}
-
-fn polish_system_prompt(mode: &str) -> &'static str {
-    match mode {
-        "structured" => STRUCTURED_POLISH_PROMPT,
-        "professional" => EXPERT_POLISH_PROMPT,
-        "concise" => CONCISE_POLISH_PROMPT,
-        "general" => OPTIMIZE_POLISH_PROMPT,
-        _ => OPTIMIZE_POLISH_PROMPT,
-    }
-}
-
-fn polish_mode_label(mode: &str) -> &'static str {
-    match mode {
-        "structured" => "结构化",
-        "professional" => "专家增强",
-        "concise" => "精简",
-        "general" => "优化",
-        _ => "优化",
     }
 }
 
@@ -305,6 +636,11 @@ fn extract_json_array(json_like: &str) -> Result<&str, String> {
         let end = trimmed
             .rfind(']')
             .ok_or_else(|| "处理要点解析失败：缺少 JSON 数组结束符".to_string())?;
+        // `]` 可能出现在 `[` 之前（如模型输出 `"]["`），此时 end < start，
+        // 直接切片会 panic —— 走正常错误路径拒绝。
+        if end < start {
+            return Err("处理要点解析失败：JSON 数组括号顺序异常".to_string());
+        }
         return Ok(trimmed[start..=end].trim());
     }
 
@@ -313,8 +649,8 @@ fn extract_json_array(json_like: &str) -> Result<&str, String> {
 
 fn parse_polish_process_steps(response: &str) -> Result<Vec<PolishProcessStep>, String> {
     let json_str = extract_json_array(response)?;
-    let steps: Vec<PolishProcessStep> = serde_json::from_str(json_str)
-        .map_err(|e| format!("处理要点解析失败，请重试: {}", e))?;
+    let steps: Vec<PolishProcessStep> =
+        serde_json::from_str(json_str).map_err(|e| format!("处理要点解析失败，请重试: {}", e))?;
 
     let steps: Vec<PolishProcessStep> = steps
         .into_iter()
@@ -333,114 +669,6 @@ fn parse_polish_process_steps(response: &str) -> Result<Vec<PolishProcessStep>, 
     }
 }
 
-const POLISH_PROCESS_PROMPT: &str = r#"你是 PromptDock 的「可展示处理要点」生成器。
-
-任务：
-根据用户原始 Prompt 和所选润色模式，生成本次 AI 将如何处理这个 Prompt 的 3-4 条可展示要点。
-
-重要边界：
-- 这些要点是给用户看的“处理计划/优化方向”，不是隐藏思维链。
-- 不要输出逐步推理、内心分析、长篇解释或最终润色结果。
-- 必须结合用户原文中的具体任务，不要返回通用套话。
-- 不要编造用户没有提供的事实。
-
-JSON 格式要求：
-[
-  { "title": "不超过8个汉字", "desc": "不超过28个汉字，说明本步会处理什么" }
-]
-
-只返回 JSON 数组，不要包含 Markdown、代码块或其他文本。"#;
-
-const OPTIMIZE_POLISH_PROMPT: &str = r#"你是 PromptDock 的「优化」skill，负责把用户输入改写成更清晰、具体、可执行的 Prompt。
-
-适合场景：
-- 用户的表达偏口语化、模糊、缺少关键条件。
-- 用户想提升一次生成质量，但不需要完整工作流。
-
-内部处理流程：
-1. 识别用户真实意图和任务类型，例如写作、代码、分析、图像、营销、学习、汇报、产品设计或其他。
-2. 判断原 Prompt 缺少哪些会影响执行质量的信息：目标对象、主题范围、输出形式、语气风格、限制条件、评价标准。
-3. 在不编造事实的前提下补足必要执行条件；无法确定的信息用 [待补充] 占位。
-4. 将口语化表达改写成可直接交给 AI 执行的 Prompt。
-
-边界：
-- 不大幅扩写，不把简单任务改造成复杂方案。
-- 不强制结构化，不添加用户没有暗示的业务背景。
-- 不改变用户原意。
-
-输出规则：
-- 直接返回优化后的 Prompt，不要解释。
-- 保留用户原始目标，补足必要对象、范围、语气、格式或限制。
-- 让模型拿到结果后能立刻执行。"#;
-
-const STRUCTURED_POLISH_PROMPT: &str = r#"你是 PromptDock 的「结构化」skill，负责把散乱需求整理成模块化 Prompt。
-
-适合场景：
-- 用户提供了多个要求、背景、条件或输出格式，但信息组织松散。
-- 用户希望 Prompt 更容易复用和二次编辑。
-
-内部处理流程：
-1. 识别用户真实意图、任务类型和已有信息块。
-2. 合并重复要求，把背景、目标、约束、输出格式、素材和注意事项分组。
-3. 根据输入复杂度选择章节；简单输入使用轻结构，复杂输入使用完整结构。
-4. 对缺失但必要的信息使用 [待补充]，不要编造具体事实。
-
-边界：
-- 重点是组织信息，不做不必要扩写。
-- 不把任务升级成专家方案，除非用户已经给出明确专业场景。
-- 不要机械套用所有章节，避免空壳标题。
-
-输出规则：
-- 直接返回结构化后的 Prompt，不要解释。
-- 使用清晰章节组织内容，优先包含：角色、任务、背景、约束、输出格式、注意事项。
-- 可以使用标题和要点，但避免空泛模板。"#;
-
-const CONCISE_POLISH_PROMPT: &str = r#"你是 PromptDock 的「精简」skill，负责压缩 Prompt，保留核心诉求和关键信息。
-
-适合场景：
-- 用户输入过长、重复、夹杂聊天语气或低价值背景。
-- 用户希望得到更短、更可复用、更省 token 的 Prompt。
-
-内部处理流程：
-1. 识别用户真实意图、任务类型和不可删除的关键条件。
-2. 删除寒暄、重复表达、弱相关背景、犹豫语气和多余修饰。
-3. 合并相近要求，保留任务目标、关键对象、必要限制、输出格式和质量底线。
-4. 如果原文很长，优先压缩到原长度的 40%-70%；如果原文很短，只做去噪和轻量压缩。
-
-边界：
-- 不要扩写。
-- 不新增角色设定、复杂步骤或额外输出要求。
-- 不删除会影响结果质量的关键条件。
-- 不改变任务类型。
-
-输出规则：
-- 直接返回精简后的 Prompt，不要解释。
-- 保留核心诉求、关键对象、必要约束和输出格式。
-- 删除客套话、重复表达、弱相关背景和多余修饰。"#;
-
-const EXPERT_POLISH_PROMPT: &str = r#"你是 PromptDock 的「专家增强」skill，负责把用户需求升级为专家级 Prompt，用于正式工作和高质量复杂任务。
-
-适合场景：
-- 正式工作中的报告、方案、分析、代码审查、产品设计、营销策划、研究任务。
-- 用户需要更稳定、更专业、更可控的输出。
-
-内部处理流程：
-1. 识别任务类型，并选择合适的专家框架：报告、方案、分析、代码审查、营销、产品设计、研究、图像生成或其他。
-2. 提炼用户真实目标，判断缺失的关键上下文、受众、交付物、约束、评价标准和风险边界。
-3. 在不编造事实的前提下补充合理的角色、执行步骤、输出格式和质量标准。
-4. 对不确定信息使用 [待补充]，让用户后续可编辑；不要编造业务细节、数据、案例或用户未提供的事实。
-5. 输出一份能用于正式工作的专家级 Prompt。
-
-边界：
-- 这是进阶增强，不适合简单翻译、短文案、一次性小任务。
-- 可以补充合理的角色、背景、步骤和质量标准，但不能虚构具体事实。
-- 若用户原始信息不足，用通用但可执行的约束表达，不要编造业务细节。
-
-输出规则：
-- 直接返回增强后的 Prompt，不要解释。
-- 明确包含任务角色、目标、背景假设、执行步骤、输出格式、约束条件和质量标准。
-- 输出应像一份可交给专家模型执行的正式任务说明。"#;
-
 /// AI polish/optimize a prompt — uses the active API config
 #[tauri::command]
 pub async fn polish_prompt(
@@ -455,9 +683,14 @@ pub async fn polish_prompt(
 }
 
 /// Stream AI polish output as chunks and return the final content.
+///
+/// `request_id` identifies this invocation so `cancel_polish_stream` can abort
+/// it mid-flight; the frontend generates one per call.
 #[tauri::command]
 pub async fn polish_prompt_stream(
     state: tauri::State<'_, DbState>,
+    cancel_state: tauri::State<'_, PolishCancelState>,
+    request_id: String,
     content: String,
     mode: String,
     on_chunk: Channel<PolishStreamEvent>,
@@ -465,7 +698,22 @@ pub async fn polish_prompt_stream(
     let settings = api_configs::get_active_settings(&state)?;
     let system_prompt = polish_system_prompt(&mode);
 
-    chat_completion_stream(&settings, system_prompt, &content, on_chunk).await
+    let cancelled = cancel_state.register(&request_id)?;
+    let result =
+        chat_completion_stream(&settings, system_prompt, &content, on_chunk, &cancelled).await;
+    // 正常结束、出错结束、被取消三条路径都要移除条目，避免 map 泄漏。
+    cancel_state.unregister(&request_id)?;
+    result
+}
+
+/// Cancel an in-flight `polish_prompt_stream`. Idempotent: unknown or already
+/// finished request ids are silently ignored.
+#[tauri::command]
+pub fn cancel_polish_stream(
+    cancel_state: tauri::State<'_, PolishCancelState>,
+    request_id: String,
+) -> Result<(), String> {
+    cancel_state.cancel(&request_id)
 }
 
 /// Generate user-visible AI process steps for the selected polish mode.
@@ -494,40 +742,37 @@ pub async fn auto_classify(
 ) -> Result<ClassifyResult, String> {
     let settings = api_configs::get_active_settings(&state)?;
 
-    let system_prompt = r#"你是一个提示词分类专家。分析用户给出的提示词，返回严格的 JSON 格式结果。
-
-可选的分类有：内容创作、代码开发、学习研究、销售营销、数据分析、图像生成、工作汇报、产品设计、视频脚本、其他
-
-标签规则：最多5个标签，每个不超过15字，使用中文。
-
-JSON 格式要求：
-{
-  "category": "分类名称",
-  "tags": ["标签1", "标签2", "标签3"],
-  "summary": "一句话摘要，不超过50字",
-  "recommended_tool": "推荐的AI工具：ChatGPT / Claude / DeepSeek / Midjourney / Gemini / Cursor / Other"
-}
-
-只返回 JSON，不要包含其他内容。"#;
+    let system_prompt = CLASSIFY_SYSTEM_PROMPT;
 
     let response = chat_completion(&settings, system_prompt, &content).await?;
-    let json_str = response.trim();
-
-    let json_str = if let Some(start) = json_str.find("```json") {
-        let start = start + 7;
-        let end = json_str[start..]
-            .find("```")
-            .unwrap_or(json_str.len() - start);
-        &json_str[start..start + end]
-    } else if let Some(start) = json_str.find('{') {
-        let end = json_str.rfind('}').unwrap_or(json_str.len() - 1);
-        &json_str[start..=end]
-    } else {
-        json_str
-    };
+    let json_str = extract_json_object(response.trim())?;
 
     serde_json::from_str::<ClassifyResult>(json_str)
         .map_err(|e| format!("自动分类解析失败，请重试: {}", e))
+}
+
+/// Extracts the JSON object from a model response that may wrap it in a
+/// ```json fence or surrounding prose.
+fn extract_json_object(response: &str) -> Result<&str, String> {
+    if let Some(start) = response.find("```json") {
+        let start = start + 7;
+        let end = response[start..]
+            .find("```")
+            .unwrap_or(response.len() - start);
+        return Ok(response[start..start + end].trim());
+    }
+
+    if let Some(start) = response.find('{') {
+        let end = response.rfind('}').unwrap_or(response.len() - 1);
+        // `}` 可能出现在 `{` 之前（如模型输出 `"}{"`），此时 end < start，
+        // 直接切片会 panic —— 走正常错误路径拒绝。
+        if end < start {
+            return Err("自动分类解析失败：JSON 对象括号顺序异常".to_string());
+        }
+        return Ok(&response[start..=end]);
+    }
+
+    Ok(response)
 }
 
 /// Test connection for a specific API config with the provided API key.
@@ -538,6 +783,17 @@ pub async fn test_connection(
     api_key: String,
     model: String,
 ) -> Result<String, String> {
+    // `test_connection` is callable directly over IPC and receives its own URL,
+    // so it has to enforce the same rules as saved configs — otherwise it
+    // becomes an unvalidated SSRF primitive for local services.
+    crate::api_configs::validate_base_url(base_url.trim())?;
+    if api_key.trim().is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+    if model.trim().is_empty() {
+        return Err("模型名称不能为空".to_string());
+    }
+
     let config_id = Uuid::new_v4().to_string();
     let settings = ApiSettings {
         config_id: config_id.clone(),
@@ -559,52 +815,6 @@ pub async fn test_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn polish_skill_prompts_define_clear_boundaries() {
-        let optimize = polish_system_prompt("general");
-        assert!(optimize.contains("不大幅扩写"));
-        assert!(optimize.contains("不改变用户原意"));
-        assert!(optimize.contains("识别用户真实意图"));
-        assert!(optimize.contains("[待补充]"));
-
-        let structured = polish_system_prompt("structured");
-        assert!(structured.contains("角色"));
-        assert!(structured.contains("任务"));
-        assert!(structured.contains("输出格式"));
-        assert!(structured.contains("根据输入复杂度选择章节"));
-        assert!(structured.contains("不要机械套用所有章节"));
-
-        let concise = polish_system_prompt("concise");
-        assert!(concise.contains("不要扩写"));
-        assert!(concise.contains("保留核心诉求"));
-        assert!(concise.contains("40%-70%"));
-        assert!(concise.contains("不改变任务类型"));
-
-        let expert = polish_system_prompt("professional");
-        assert!(expert.contains("专家级"));
-        assert!(expert.contains("质量标准"));
-        assert!(expert.contains("正式工作"));
-        assert!(expert.contains("识别任务类型"));
-        assert!(expert.contains("不要编造业务细节"));
-        assert!(expert.contains("[待补充]"));
-    }
-
-    #[test]
-    fn unknown_polish_skill_falls_back_to_optimize() {
-        assert_eq!(
-            polish_system_prompt("missing"),
-            polish_system_prompt("general")
-        );
-    }
-
-    #[test]
-    fn polish_process_prompt_requests_visible_steps_not_hidden_reasoning() {
-        assert!(POLISH_PROCESS_PROMPT.contains("可展示要点"));
-        assert!(POLISH_PROCESS_PROMPT.contains("不是隐藏思维链"));
-        assert!(POLISH_PROCESS_PROMPT.contains("必须结合用户原文"));
-        assert!(POLISH_PROCESS_PROMPT.contains("只返回 JSON 数组"));
-    }
 
     #[test]
     fn parse_polish_process_steps_accepts_json_array_with_wrapping_text() {
@@ -637,5 +847,399 @@ mod tests {
         let error = parse_polish_process_steps("我会先分析，再优化").unwrap_err();
 
         assert!(error.contains("JSON 数组"));
+    }
+
+    // ------------------ Request auth headers ------------------
+
+    fn built_headers(provider: &str) -> reqwest::header::HeaderMap {
+        apply_auth_headers(
+            Client::new().post("https://example.com/v1/messages"),
+            provider,
+            "secret-key",
+        )
+        .build()
+        .expect("build request")
+        .headers()
+        .clone()
+    }
+
+    #[test]
+    fn anthropic_requests_declare_the_required_version_header() {
+        // 回归测试：缺少 anthropic-version 时 Messages API 直接返回
+        // 400 "anthropic-version: header is required"，Anthropic 配置完全不可用。
+        let headers = built_headers("anthropic");
+
+        assert_eq!(headers["anthropic-version"], ANTHROPIC_API_VERSION);
+        assert_eq!(headers["x-api-key"], "secret-key");
+        assert!(
+            headers.get("authorization").is_none(),
+            "Anthropic 不用 Bearer 认证"
+        );
+    }
+
+    #[test]
+    fn openai_compatible_requests_use_bearer_auth_only() {
+        let headers = built_headers("deepseek");
+
+        assert_eq!(headers["authorization"], "Bearer secret-key");
+        assert!(
+            headers.get("anthropic-version").is_none(),
+            "非 Anthropic provider 不应带 anthropic-version"
+        );
+        assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn provider_matching_is_case_insensitive_and_substring_based() {
+        assert!(is_anthropic_provider("Anthropic"));
+        assert!(is_anthropic_provider("ANTHROPIC"));
+        assert!(!is_anthropic_provider("openai"));
+        assert!(!is_anthropic_provider("kimi"));
+    }
+
+    // ------------------ Timeouts ------------------
+
+    #[test]
+    fn build_client_succeeds_with_configured_timeouts() {
+        // 超时常量本身由模块顶部的 const 断言在编译期守护。
+        assert!(build_client().is_ok());
+        assert!(build_stream_client().is_ok());
+    }
+
+    #[test]
+    fn upstream_error_bodies_are_truncated() {
+        let short = "invalid key";
+        assert_eq!(truncate_error_body(short), short);
+
+        let long = "错".repeat(MAX_ERROR_BODY_CHARS + 1);
+        let truncated = truncate_error_body(&long);
+        assert_eq!(truncated.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn http_client_is_created_once_and_shared() {
+        // 回归测试：以前每个请求都新建 Client，连接池无法复用。
+        let _ = build_client().expect("build client");
+
+        assert!(
+            HTTP_CLIENT.get().is_some(),
+            "Client 应被缓存并复用，而不是每次请求重新创建"
+        );
+    }
+
+    // ------------------ SSE buffering ------------------
+
+    #[test]
+    fn sse_buffer_splits_lines_that_span_chunk_boundaries() {
+        let mut buffer = SseBuffer::default();
+
+        assert!(
+            buffer.push(b"data: {\"a\":").expect("push").is_empty(),
+            "未收满一行不应产出"
+        );
+        assert_eq!(
+            buffer.push(b"1}\ndata: {\"b\":2}\n").expect("push"),
+            vec!["data: {\"a\":1}", "data: {\"b\":2}"]
+        );
+    }
+
+    #[test]
+    fn sse_buffer_ignores_carriage_returns_and_blank_lines() {
+        let mut buffer = SseBuffer::default();
+
+        assert_eq!(
+            buffer.push(b"data: x\r\n\r\ndata: y\r\n").expect("push"),
+            vec!["data: x", "", "data: y"]
+        );
+    }
+
+    #[test]
+    fn sse_buffer_flushes_a_trailing_line_without_a_newline() {
+        // 回归测试：流结束时最后一行常常没有换行符，旧实现直接把它丢了 ——
+        // 表现为回答的最后一个分片凭空消失。
+        let mut buffer = SseBuffer::default();
+
+        assert!(buffer
+            .push(b"data: {\"tail\":true}")
+            .expect("push")
+            .is_empty());
+
+        assert_eq!(
+            buffer.push(b"\n").expect("flush"),
+            vec!["data: {\"tail\":true}"]
+        );
+    }
+
+    #[test]
+    fn sse_buffer_rejects_an_unterminated_line_that_grows_too_large() {
+        let mut buffer = SseBuffer::default();
+        let chunk = vec![b'a'; SSE_LINE_MAX_BYTES + 1];
+
+        assert!(
+            buffer.push(&chunk).is_err(),
+            "没有换行且超过上限时应中止，而不是无限增长内存"
+        );
+    }
+
+    #[test]
+    fn sse_buffer_decodes_multibyte_chars_split_across_chunks() {
+        // 回归测试：旧实现按 chunk 做 from_utf8_lossy，中文字符（3 字节）恰好
+        // 跨 chunk 时跨界字节变成 U+FFFD，润色结果混入乱码。
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"你好，世界\"}}]}\n";
+        let bytes = payload.as_bytes();
+        // 断点落在「你」的 3 个字节中间。
+        let split = bytes
+            .windows(3)
+            .position(|w| w == "你".as_bytes())
+            .expect("payload 应包含中文")
+            + 1;
+
+        let mut buffer = SseBuffer::default();
+        assert!(buffer.push(&bytes[..split]).expect("push").is_empty());
+        let lines = buffer.push(&bytes[split..]).expect("push");
+
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('\u{FFFD}'), "不应出现替换字符");
+        let data = lines[0].strip_prefix("data:").expect("data 行");
+        assert_eq!(
+            classify_stream_payload("deepseek", data),
+            StreamEvent::Delta("你好，世界".to_string())
+        );
+    }
+
+    // ------------------ Stream payload classification ------------------
+
+    fn classify(provider: &str, data: &str) -> StreamEvent {
+        classify_stream_payload(provider, data)
+    }
+
+    #[test]
+    fn openai_stream_deltas_are_extracted() {
+        let payload = r#"{"choices":[{"delta":{"content":"你好"}}]}"#;
+
+        assert_eq!(
+            classify("deepseek", payload),
+            StreamEvent::Delta("你好".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_role_only_delta_is_ignored() {
+        // 首个分片只有 role 没有 content，不应产生空 delta。
+        let payload = r#"{"choices":[{"delta":{"role":"assistant"}}]}"#;
+
+        assert_eq!(classify("deepseek", payload), StreamEvent::Ignore);
+    }
+
+    #[test]
+    fn anthropic_content_block_delta_is_extracted() {
+        let payload = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"世界"}}"#;
+
+        assert_eq!(
+            classify("anthropic", payload),
+            StreamEvent::Delta("世界".to_string())
+        );
+    }
+
+    #[test]
+    fn anthropic_lifecycle_events_are_ignored() {
+        for payload in [
+            r#"{"type":"message_start","message":{"id":"m"}}"#,
+            r#"{"type":"content_block_start","index":0}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            assert_eq!(
+                classify("anthropic", payload),
+                StreamEvent::Ignore,
+                "应忽略生命周期事件: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn done_marker_is_recognised() {
+        assert_eq!(classify("deepseek", "[DONE]"), StreamEvent::Done);
+    }
+
+    #[test]
+    fn unparseable_payloads_are_skipped_not_fatal() {
+        // 回归测试：旧实现在遇到第一个非 JSON 行时用 `?` 中断整个流。
+        // 网关噪声、部分服务的注释行、心跳都不该毁掉一次正常的回答。
+        for payload in [
+            "",
+            "  ",
+            "<html>502 Bad Gateway</html>",
+            "ping",
+            "{not json}",
+        ] {
+            assert_eq!(
+                classify("deepseek", payload),
+                StreamEvent::Ignore,
+                "应跳过而非报错: {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_error_events_surface_no_delta() {
+        // Anthropic 在流中途可能推送 error 事件；不解析出 delta，但也不 panic。
+        let payload = r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#;
+
+        assert_eq!(classify("anthropic", payload), StreamEvent::Ignore);
+    }
+
+    // ------------------ Malformed LLM JSON must not panic ------------------
+
+    #[test]
+    fn extract_json_array_rejects_reversed_brackets() {
+        // 回归测试：`"]["` 之类输出会让 `]` 出现在 `[` 之前，旧实现的
+        // `trimmed[start..=end]` 切片直接 panic。
+        for input in ["][", "]x[", "] ["] {
+            assert!(
+                extract_json_array(input).is_err(),
+                "应返回 Err 而非 panic: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_json_object_rejects_reversed_braces() {
+        // 回归测试：`"}{"` 之类输出会让 `}` 出现在 `{` 之前，旧实现同款 panic。
+        for input in ["}{", "}x{", "} {"] {
+            assert!(
+                extract_json_object(input).is_err(),
+                "应返回 Err 而非 panic: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_json_object_still_accepts_fence_and_plain_object() {
+        let fenced = "```json\n{\"a\":1}\n```";
+        assert_eq!(extract_json_object(fenced).unwrap(), "{\"a\":1}");
+        assert_eq!(
+            extract_json_object("前言 {\"a\":1} 后记").unwrap(),
+            "{\"a\":1}"
+        );
+        // 没有任何括号时原样返回，交给 serde 报错。
+        assert_eq!(extract_json_object("不是 JSON").unwrap(), "不是 JSON");
+    }
+
+    // ------------------ Stream cancellation ------------------
+
+    #[test]
+    fn cancel_unknown_request_id_is_a_noop() {
+        // 取消必须幂等：前端可能因时序取消一个已结束或从未存在的请求。
+        let state = PolishCancelState::default();
+
+        state
+            .cancel("nonexistent")
+            .expect("取消不存在的 id 不应报错");
+    }
+
+    #[test]
+    fn cancel_sets_the_flag_and_unregister_cleans_up() {
+        let state = PolishCancelState::default();
+
+        let token = state.register("req-1").expect("register");
+        assert!(!token.is_cancelled());
+
+        state.cancel("req-1").expect("cancel");
+        assert!(token.is_cancelled(), "取消标志应被置位");
+
+        state.unregister("req-1").expect("unregister");
+        assert!(
+            state.0.lock().expect("lock").is_empty(),
+            "结束后必须从 map 移除条目，避免泄漏"
+        );
+        // 已结束的请求再取消仍是幂等 no-op。
+        state.cancel("req-1").expect("cancel after unregister");
+    }
+
+    fn ok_chunks(
+        payloads: &[&str],
+    ) -> impl Stream<Item = Result<Vec<u8>, std::convert::Infallible>> {
+        let chunks: Vec<_> = payloads.iter().map(|p| Ok(p.as_bytes().to_vec())).collect();
+        futures_util::stream::iter(chunks)
+    }
+
+    #[tokio::test]
+    async fn cancelled_flag_stops_the_stream_loop() {
+        let stream = ok_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        ]);
+        // 循环开始前就已取消：一个 chunk 都不应被消费。
+        let cancelled = CancelToken::default();
+        cancelled.cancel();
+        let mut emitted = Vec::new();
+
+        let err = consume_sse_stream(
+            "deepseek",
+            stream,
+            &mut |delta: String| {
+                emitted.push(delta);
+                Ok(())
+            },
+            &cancelled,
+        )
+        .await
+        .expect_err("取消不应被当成正常完成");
+
+        assert_eq!(err, POLISH_CANCELLED);
+        assert!(emitted.is_empty(), "已取消的流不应再推送 delta");
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_stream_stops_after_current_chunk() {
+        let stream = ok_chunks(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+        ]);
+        let cancelled = Arc::new(CancelToken::default());
+        let cancel_from_emit = Arc::clone(&cancelled);
+        let mut emitted = Vec::new();
+
+        let err = consume_sse_stream(
+            "deepseek",
+            stream,
+            &mut |delta: String| {
+                // 模拟前端在收到第一个 delta 后立刻点了取消。
+                cancel_from_emit.cancel();
+                emitted.push(delta);
+                Ok(())
+            },
+            &cancelled,
+        )
+        .await
+        .expect_err("中途取消不应返回截断内容");
+
+        assert_eq!(err, POLISH_CANCELLED);
+        assert_eq!(emitted, vec!["a".to_string()], "取消后不应再消费后续 chunk");
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_stream_that_is_waiting_for_data() {
+        // 回归测试：旧实现只在收到下一个 chunk 后检查 AtomicBool，
+        // 上游静默时取消要等到 read timeout(120s) 才生效。
+        let cancelled = Arc::new(CancelToken::default());
+        let cancel_from_task = Arc::clone(&cancelled);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel_from_task.cancel();
+        });
+
+        let stream = futures_util::stream::pending::<Result<Vec<u8>, std::convert::Infallible>>();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            consume_sse_stream("deepseek", stream, &mut |_| Ok(()), &cancelled),
+        )
+        .await
+        .expect("取消应在一秒内生效，而不是等 read timeout");
+
+        assert_eq!(result.expect_err("应返回取消错误"), POLISH_CANCELLED);
     }
 }

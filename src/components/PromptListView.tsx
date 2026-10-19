@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { usePromptStore } from "@/stores/promptStore";
 import type { ListMode } from "@/App";
+import { formatDate } from "@/lib/formatDate";
 
 interface PromptListViewProps {
   mode: ListMode;
@@ -25,26 +26,30 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
   const isSearching = usePromptStore((s) => s.isSearching);
   const loadPrompts = usePromptStore((s) => s.loadPrompts);
   const search = usePromptStore((s) => s.search);
+  const clearSearch = usePromptStore((s) => s.clearSearch);
 
   useEffect(() => {
     loadPrompts();
   }, [loadPrompts, mode]);
 
-  const displayItems =
-    searchQuery.trim()
-      ? searchResults.map((r) => ({
-          id: r.id,
-          title: r.title,
-          content: r.summary || "",
-          category: r.category,
-          is_favorite: false,
-          updated_at: r.updated_at,
-        }))
-      : mode === "recent"
-        ? [...prompts].sort((a, b) =>
-            (b.last_used_at || b.updated_at).localeCompare(a.last_used_at || a.updated_at)
-          )
-        : prompts;
+  // 搜索来自列表自带的搜索框，不经过 `mode`。切模式时由 App 负责清空，
+  // 这里只需如实反映当前是否处于搜索态。
+  const isSearchActive = searchQuery.trim().length > 0;
+
+  const displayItems = isSearchActive
+    ? searchResults.map((r) => ({
+        id: r.id,
+        title: r.title,
+        content: r.summary || "",
+        category: r.category,
+        is_favorite: r.is_favorite,
+        updated_at: r.updated_at,
+      }))
+    : mode === "recent"
+      ? [...prompts].sort((a, b) =>
+          (b.last_used_at || b.updated_at).localeCompare(a.last_used_at || a.updated_at)
+        )
+      : prompts;
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -53,7 +58,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
         <div className="flex items-center gap-3">
           <div>
             <h1 className="text-[18px] font-semibold text-slate-100">
-              {searchQuery.trim() ? MODE_LABELS.search : MODE_LABELS[mode]}
+              {isSearchActive ? MODE_LABELS.search : MODE_LABELS[mode]}
             </h1>
             {mode === "category" && selectedCategory && (
               <p className="text-[13px] text-purple-400 mt-0.5">
@@ -89,8 +94,30 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
               search(e.target.value);
             }}
             placeholder="搜索 Prompt 标题、内容、标签..."
+            aria-label="搜索 Prompt"
             className="flex-1 bg-transparent text-[13px] text-slate-300 placeholder:text-slate-600 outline-none"
           />
+          {isSearchActive && !isSearching && (
+            <button
+              type="button"
+              onClick={clearSearch}
+              aria-label="清空搜索"
+              className="shrink-0 text-slate-500 hover:text-slate-300 transition-colors"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          )}
           {isSearching && (
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -108,7 +135,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
         </div>
 
         {/* Active filters */}
-        {(favoriteOnly || selectedCategory) && mode !== "search" && (
+        {!isSearchActive && (favoriteOnly || selectedCategory) && (
           <div className="flex items-center gap-1.5">
             <span className="text-[11px] text-slate-500">筛选：</span>
             {favoriteOnly && (
@@ -141,9 +168,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
             </svg>
             <p className="text-[13px] text-slate-600">
-              {searchQuery.trim()
-                ? "未找到匹配的 Prompt"
-                : "暂无 Prompt"}
+              {isSearchActive ? "未找到匹配的 Prompt" : "暂无 Prompt"}
             </p>
           </div>
         ) : (
@@ -188,7 +213,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
                       </p>
                     </div>
                     <span className="text-[11px] text-slate-600 shrink-0 mt-0.5">
-                      {new Date(item.updated_at).toLocaleDateString("zh-CN")}
+                      {formatDate(item.updated_at)}
                     </span>
                   </div>
                 </button>

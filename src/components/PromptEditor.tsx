@@ -3,7 +3,6 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { usePromptStore } from "@/stores/promptStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { useAutoSave } from "@/hooks/useAutoSave";
 import { useToast } from "@/components/ui/toast";
 import { getErrorMessage } from "@/lib/utils";
 import { PolishPanel } from "@/components/PolishPanel";
@@ -25,12 +24,11 @@ export function PromptEditor() {
 
   const activeConfig = useSettingsStore((s) => s.activeConfig);
   const isLoaded = useSettingsStore((s) => s.isLoaded);
+  const configError = useSettingsStore((s) => s.error);
   const { addToast } = useToast();
   const [showTitleInput, setShowTitleInput] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-
-  useAutoSave();
 
   const insertFormatting = useCallback(
     (before: string, after: string, placeholder: string) => {
@@ -221,6 +219,16 @@ export function PromptEditor() {
               {charCount} 字 / {wordCount} 词
             </span>
           </div>
+
+          {/* 读取配置失败时说明为什么没有润色区，而不是静默隐藏 */}
+          {isLoaded && !activeConfig && configError && (
+            <>
+              <div className="border-t border-white/[0.05]" />
+              <div role="alert" className="px-5 py-3 text-[12px] text-red-300/90">
+                读取 API 配置失败，暂时无法使用 AI 润色：{configError}
+              </div>
+            </>
+          )}
 
           {/* Polish section */}
           {isLoaded && activeConfig && (

@@ -46,4 +46,5 @@ pub struct SearchResult {
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub updated_at: String,
+    pub is_favorite: bool,
 }
