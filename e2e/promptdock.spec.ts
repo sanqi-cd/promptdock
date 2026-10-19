@@ -82,6 +82,8 @@ test.describe("侧边栏导航", () => {
     const textarea = page.locator("textarea").first();
     await textarea.fill("测试内容");
     await page.locator("aside button", { hasText: "新建 Prompt" }).click();
+    // 输入不足 3s，自动保存未触发：先弹「丢弃未保存修改」确认
+    await page.getByRole("button", { name: "丢弃并新建" }).click();
     await expect(textarea).toHaveValue("");
   });
 
@@ -218,7 +220,10 @@ test.describe("PromptEditor 编辑器", () => {
           }
           if (cmd === "polish_prompt") {
             polishCalls.push({ cmd, ...args });
-            const delay = args?.mode === "general" ? 1000 : 100;
+            // general 必须明显长于 PROCESS_ANALYSIS_DELAY_MS(800ms)：
+            // 进度区只在结果返回前渲染，1000ms 只留下约 200ms 的断言窗口，
+            // webkit 调度稍慢就会 flaky。2000ms 给测试稳定的观察时间。
+            const delay = args?.mode === "general" ? 2000 : 100;
             await new Promise((resolve) => window.setTimeout(resolve, delay));
             return `${args?.mode} result from ${args?.content}`;
           }
@@ -730,6 +735,120 @@ test.describe("交叉导航", () => {
 });
 
 /**
+ * 后台失败的可视化。
+ *
+ * store 里的 `error` 字段记录了列表加载、Prompt 加载、搜索的失败，但在这次改动
+ * 之前**没有任何组件渲染它** —— 用户看到的是空白列表，完全不知道出了什么事。
+ */
+test.describe("错误提示", () => {
+  const FAILURE = "读取 Prompt 列表失败: database is locked";
+
+  test("列表加载失败时显示可关闭的错误横幅", async ({ page }) => {
+    await page.addInitScript(
+      ({ failure }: { failure: string }) => {
+        window.__TAURI_INTERNALS__ = {
+          invoke: async (cmd: string) => {
+            if (cmd === "list_api_configs") return [];
+            if (cmd === "list_prompts") throw failure;
+            return null;
+          },
+          transformCallback: () => 1,
+          unregisterCallback: () => {},
+          runCallback: () => {},
+        };
+      },
+      { failure: FAILURE }
+    );
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+
+    const banner = page.getByRole("alert");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("读取 Prompt 列表失败");
+
+    await page.getByRole("button", { name: "关闭错误提示" }).click();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  });
+
+  test("后续加载成功后错误横幅自动消失", async ({ page }) => {
+    await page.addInitScript(
+      ({ failure }: { failure: string }) => {
+        let failing = true;
+        (window as unknown as { __recover: () => void }).__recover = () => {
+          failing = false;
+        };
+
+        window.__TAURI_INTERNALS__ = {
+          invoke: async (cmd: string) => {
+            if (cmd === "list_api_configs") return [];
+            if (cmd === "list_prompts") {
+              if (failing) throw failure;
+              return [
+                {
+                  id: "recovered",
+                  title: "恢复后的记录",
+                  content: "内容",
+                  optimized_content: null,
+                  category: null,
+                  summary: null,
+                  is_favorite: false,
+                  created_at: "2026-06-21 19:36:00",
+                  updated_at: "2026-06-21 19:36:00",
+                  last_used_at: "2026-06-21 19:36:00",
+                },
+              ];
+            }
+            return null;
+          },
+          transformCallback: () => 1,
+          unregisterCallback: () => {},
+          runCallback: () => {},
+        };
+      },
+      { failure: FAILURE }
+    );
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await expect(page.getByRole("alert")).toBeVisible();
+
+    // 故障恢复后换一个列表模式，触发新的加载
+    await page.evaluate(() =>
+      (window as unknown as { __recover: () => void }).__recover()
+    );
+    await page.locator("nav button", { hasText: "收藏" }).click();
+
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(page.getByText("恢复后的记录")).toBeVisible();
+  });
+
+  test("搜索失败时显示错误横幅而不是静默显示无结果", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "search_prompts") throw "搜索失败：数据库繁忙";
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await page.getByPlaceholder("搜索 Prompt 标题、内容、标签...").fill("视频");
+
+    const banner = page.getByRole("alert");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("搜索失败");
+  });
+});
+
+/**
  * 后端时间戳的展示。
  *
  * 后端写的是 `datetime('now','localtime')` → `"2026-06-21 19:36:00"`：非 ISO 8601、
@@ -1015,5 +1134,923 @@ test.describe("搜索与列表模式隔离", () => {
     await expect(searchBox).toHaveValue("");
     await expect(page.getByText("搜索结果项-0")).toHaveCount(0);
     await expect(page.getByText("全部项-0")).toBeVisible();
+  });
+});
+
+/**
+ * 未保存内容保护。
+ *
+ * 自动保存有 3s 防抖，输入后立刻点「新建」会丢掉还没落库的内容。现在脏检查
+ * （当前 title/content 对比最近一次保存快照）发现修改时先弹确认。
+ */
+test.describe("未保存内容保护", () => {
+  test("取消确认后保留正在编辑的内容", async ({ page }) => {
+    await page.goto(BASE);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("还没保存的内容");
+
+    await page.locator("aside button", { hasText: "新建 Prompt" }).click();
+    await expect(page.getByText("丢弃未保存的修改")).toBeVisible();
+
+    await page.getByRole("button", { name: "继续编辑" }).click();
+    await expect(textarea).toHaveValue("还没保存的内容");
+  });
+
+  test("内容已保存后新建不再弹确认", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "create_prompt") {
+            return {
+              id: "saved-1",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-01-01 00:00:00",
+              updated_at: "2026-01-01 00:00:00",
+              last_used_at: null,
+            };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("会被保存的内容");
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+    await expect(page.getByText("已保存")).toBeVisible();
+
+    await page.locator("aside button", { hasText: "新建 Prompt" }).click();
+    await expect(page.getByText("丢弃未保存的修改")).toHaveCount(0);
+    await expect(textarea).toHaveValue("");
+  });
+});
+
+/**
+ * 并发保存竞态回归测试。
+ *
+ * 手动 ⌘S 与自动保存（或其它保存入口）同时发起时，两个保存都曾读到
+ * `currentId === null` 而各建一条重复记录。现在保存串行执行：第二个保存
+ * 读到第一个写回的 currentId，走 update 而不是重复 create。
+ */
+test.describe("并发保存", () => {
+  test("两个并发保存只创建一条记录，第二个走更新", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__saveCalls = [];
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "create_prompt") {
+            (window.__saveCalls as Record<string, unknown>[]).push({ cmd, ...args });
+            // 故意拖慢 create，让第二个保存在它返回前发起
+            await new Promise((resolve) => window.setTimeout(resolve, 400));
+            return {
+              id: "created-1",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-01-01 00:00:00",
+              updated_at: "2026-01-01 00:00:00",
+              last_used_at: null,
+            };
+          }
+          if (cmd === "update_prompt") {
+            (window.__saveCalls as Record<string, unknown>[]).push({ cmd, ...args });
+            return null;
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("并发保存的内容");
+
+    // 按钮保存（create 在飞）+ 立即 ⌘S（不经按钮，无 isSaving 禁用）
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+    await page.keyboard.press("Meta+s");
+
+    // 第二个保存应等第一个写回 currentId 后走 update
+    await expect
+      .poll(async () =>
+        page.evaluate(
+          () =>
+            (window.__saveCalls as Record<string, unknown>[]).filter(
+              (c) => c.cmd === "update_prompt"
+            ).length
+        )
+      )
+      .toBeGreaterThanOrEqual(1);
+
+    const createCount = await page.evaluate(
+      () =>
+        (window.__saveCalls as Record<string, unknown>[]).filter(
+          (c) => c.cmd === "create_prompt"
+        ).length
+    );
+    expect(createCount).toBe(1);
+  });
+});
+
+/**
+ * 在途 loadPrompt 竞态回归测试。
+ *
+ * 点了一条 Prompt 后立刻点「新建」，旧的 loadPrompt 慢响应返回时曾把编辑器
+ * 重置回旧 Prompt，正在输入的内容直接丢失。现在 newPrompt 会作废在途请求。
+ */
+test.describe("在途加载不覆盖新建", () => {
+  test("loadPrompt 慢响应返回后编辑器仍是新建状态", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") {
+            return [
+              {
+                id: "slow-1",
+                title: "旧 Prompt",
+                content: "旧内容",
+                optimized_content: null,
+                category: null,
+                summary: null,
+                is_favorite: false,
+                created_at: "2026-01-01 00:00:00",
+                updated_at: "2026-01-01 00:00:00",
+                last_used_at: "2026-01-01 00:00:00",
+              },
+            ];
+          }
+          if (cmd === "get_prompt") {
+            // 慢响应：新建之后才返回
+            await new Promise((resolve) => window.setTimeout(resolve, 500));
+            return {
+              id: "slow-1",
+              title: "旧 Prompt",
+              content: "旧内容",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-01-01 00:00:00",
+              updated_at: "2026-01-01 00:00:00",
+              last_used_at: "2026-01-01 00:00:00",
+            };
+          }
+          if (cmd === "get_prompt_tags") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    // 点开旧 Prompt（loadPrompt 慢响应在飞），立刻新建
+    await page.locator("main .rounded-xl button", { hasText: "旧 Prompt" }).click();
+    await page.locator("aside button", { hasText: "新建 Prompt" }).click();
+
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("正在写的新内容");
+
+    // 等慢响应确实返回之后，编辑器仍须是新建状态
+    await page.waitForTimeout(800);
+    await expect(textarea).toHaveValue("正在写的新内容");
+    await expect(
+      page.locator("main").getByText("新建 Prompt", { exact: true })
+    ).toBeVisible();
+  });
+});
+
+/**
+ * 流式润色取消回归测试。
+ *
+ * 取消按 requestId 通知后端（cancel_polish_stream，幂等）；取消后迟到的
+ * delta 和最终结果都被守卫丢弃，不再追加到结果里。
+ */
+test.describe("流式润色取消", () => {
+  test("点取消后通知后端且迟到分片不再追加", async ({ page }) => {
+    await page.addInitScript(() => {
+      const callbacks = new Map<number, (...args: unknown[]) => unknown>();
+      window.__cancelCalls = [];
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") {
+            return [
+              {
+                id: "test-config",
+                name: "测试配置",
+                provider: "Mimo",
+                base_url: "https://example.test",
+                model: "mimo-v2.5-pro",
+                is_active: true,
+                created_at: "2026-06-13T00:00:00Z",
+                updated_at: "2026-06-13T00:00:00Z",
+              },
+            ];
+          }
+          if (cmd === "polish_prompt_stream") {
+            const channel = args?.onChunk as { onmessage: (payload: unknown) => void };
+            window.setTimeout(() => channel.onmessage({ type: "delta", delta: "第一段" }), 80);
+            window.setTimeout(() => channel.onmessage({ type: "delta", delta: "第二段" }), 400);
+            await new Promise((resolve) => window.setTimeout(resolve, 1000));
+            return "第一段第二段最终内容";
+          }
+          if (cmd === "cancel_polish_stream") {
+            (window.__cancelCalls as Record<string, unknown>[]).push({ ...args });
+            return null;
+          }
+          if (cmd === "list_prompts") return [];
+          return null;
+        },
+        transformCallback: (callback: (...args: unknown[]) => unknown) => {
+          const id = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
+          callbacks.set(id, callback);
+          return id;
+        },
+        unregisterCallback: (id: number) => {
+          callbacks.delete(id);
+        },
+        runCallback: (id: number, data: unknown) => callbacks.get(id)?.(data),
+        callbacks,
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("请帮我优化这段需要取消的内容");
+    await page.getByRole("button", { name: /开始润色/ }).click();
+
+    // 第一个分片到达后点取消
+    await expect(page.getByText("第一段")).toBeVisible({ timeout: 500 });
+    await page.getByRole("button", { name: "取消", exact: true }).click();
+
+    // 后端收到带 requestId 的取消
+    await expect
+      .poll(async () =>
+        page.evaluate(() => (window.__cancelCalls as Record<string, unknown>[]).length)
+      )
+      .toBe(1);
+    const cancelArgs = await page.evaluate(
+      () => (window.__cancelCalls as Record<string, unknown>[])[0]
+    );
+    expect(typeof cancelArgs.requestId).toBe("string");
+    expect(cancelArgs.requestId).toBeTruthy();
+
+    // 按钮恢复可发起状态
+    await expect(page.getByRole("button", { name: /开始润色/ })).toBeVisible();
+
+    // 等流「跑完」之后：迟到的分片和最终结果都没有进来，也没有误报完成
+    await page.waitForTimeout(1200);
+    await expect(page.getByText("第二段")).toHaveCount(0);
+    await expect(page.getByText("第一段第二段最终内容")).toHaveCount(0);
+    await expect(page.getByText("润色完成")).toHaveCount(0);
+  });
+});
+
+/**
+ * 快捷键的真实性与上下文守卫。
+ *
+ * 「开始润色（⌘↵）」的文案长期存在但快捷键从未实现；⌘S/⌘D 此前不分上下文，
+ * 在设置页按 ⌘D 会收藏一条看不见的 Prompt。
+ */
+test.describe("快捷键", () => {
+  const baseMock = () => {
+    window.__favoriteCalls = 0;
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd === "list_api_configs") {
+          return [
+            {
+              id: "cfg",
+              name: "测试配置",
+              provider: "openai",
+              base_url: "https://example.test",
+              model: "gpt-4.1-mini",
+              is_active: true,
+              created_at: "2026-06-21 19:36:00",
+              updated_at: "2026-06-21 19:36:00",
+            },
+          ];
+        }
+        if (cmd === "polish_prompt") {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          return "润色后的内容";
+        }
+        if (cmd === "toggle_favorite") {
+          window.__favoriteCalls = (window.__favoriteCalls as number) + 1;
+          return true;
+        }
+        if (cmd === "create_prompt") {
+          return {
+            id: "prompt-1",
+            title: args?.title ?? "",
+            content: args?.content ?? "",
+            optimized_content: null,
+            category: null,
+            summary: null,
+            is_favorite: false,
+            created_at: "2026-06-21 19:36:00",
+            updated_at: "2026-06-21 19:36:00",
+            last_used_at: null,
+          };
+        }
+        if (cmd === "list_prompts") return [];
+        return null;
+      },
+      transformCallback: () => 1,
+      unregisterCallback: () => {},
+      runCallback: () => {},
+    };
+  };
+
+  test("⌘↵ 触发润色并展示结果", async ({ page }) => {
+    await page.addInitScript(baseMock);
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("帮我优化这段提示词");
+
+    await page.keyboard.press("Meta+Enter");
+
+    await expect(page.getByText("润色后的内容")).toBeVisible();
+  });
+
+  test("设置页按 ⌘D 不会收藏看不见的 Prompt", async ({ page }) => {
+    await page.addInitScript(baseMock);
+    await page.goto(BASE);
+
+    // 先保存一条，让 store.currentId 存在（没这条 ⌘D 本来也是 no-op，测不出回归）
+    await page.locator("textarea").first().fill("一条已保存的 Prompt");
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+    await expect(page.getByText("已保存", { exact: true })).toBeVisible();
+
+    // 切到设置页按 ⌘D：不该触发收藏
+    await page.locator("aside button", { hasText: "设置" }).click();
+    await page.keyboard.press("Meta+d");
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => window.__favoriteCalls)).toBe(0);
+
+    // 回到编辑器按 ⌘D：应该触发
+    await page.locator("nav button", { hasText: "工作台" }).click();
+    await page.keyboard.press("Meta+d");
+    await expect
+      .poll(async () => page.evaluate(() => window.__favoriteCalls))
+      .toBe(1);
+  });
+});
+
+/**
+ * 搜索结果此前不返回 is_favorite，前端硬编码 false，
+ * 同一条 Prompt 在「全部」里有星标、搜索出来星标消失。
+ */
+test.describe("搜索结果收藏状态", () => {
+  test("搜索结果保留收藏星标", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "search_prompts") {
+            return [
+              {
+                id: "p1",
+                title: "收藏的视频脚本",
+                summary: "帮我写一个视频脚本",
+                category: "视频脚本",
+                tags: [],
+                updated_at: "2026-06-21 19:36:00",
+                is_favorite: true,
+              },
+            ];
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await page.getByPlaceholder("搜索 Prompt 标题、内容、标签...").fill("视频");
+
+    await expect(page.getByText("收藏的视频脚本")).toBeVisible();
+    await expect(page.locator('svg[fill="#F59E0B"]')).toBeVisible();
+  });
+});
+
+/**
+ * 切换编辑目标时的数据完整性回归测试。
+ *
+ * 自动保存有 3 秒防抖；在防抖触发前切换 Prompt，旧实现会直接替换 title/content，
+ * effect cleanup 清掉 timer，最近的编辑永久丢失。现在 loadPrompt 会先 flush。
+ */
+test.describe("切换 Prompt 前保存未落库的编辑", () => {
+  const promptB = {
+    id: "prompt-b",
+    title: "B 的标题",
+    content: "B 的正文",
+    optimized_content: null,
+    category: null,
+    summary: null,
+    is_favorite: false,
+    created_at: "2026-01-01 00:00:00",
+    updated_at: "2026-01-01 00:00:00",
+    last_used_at: null,
+  };
+
+  test("3 秒内切换也会先把当前编辑写入数据库", async ({ page }) => {
+    await page.addInitScript((b) => {
+      const calls: Record<string, unknown>[] = [];
+      (window as unknown as { __calls: Record<string, unknown>[] }).__calls = calls;
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          calls.push({ cmd, ...args });
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [b];
+          if (cmd === "get_prompt") return b;
+          if (cmd === "get_prompt_tags") return [];
+          if (cmd === "update_prompt") return null;
+          if (cmd === "create_prompt") {
+            return {
+              ...b,
+              id: "prompt-a-created",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+            };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    }, promptB);
+
+    await page.goto(BASE);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("A 的未保存内容");
+
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await page.getByRole("button", { name: /B 的标题/ }).click();
+
+    await expect(textarea).toHaveValue("B 的正文");
+
+    const cmds = await page.evaluate(() =>
+      (window as unknown as { __calls: { cmd: string; content?: string }[] }).__calls
+    );
+    const create = cmds.find((call) => call.cmd === "create_prompt");
+    expect(create?.content, "切换前应先把 A 的内容落库").toBe("A 的未保存内容");
+    expect(cmds.findIndex((c) => c.cmd === "create_prompt")).toBeLessThan(
+      cmds.findIndex((c) => c.cmd === "get_prompt")
+    );
+  });
+});
+
+/**
+ * 在途保存跨编辑目标写回的回归测试。
+ *
+ * 用户保存 A 后立刻「新建」并确认丢弃；A 的 create 晚于 newPrompt 返回时，
+ * 旧实现会把 currentId 重新挂回 A，之后输入的内容会写进 A 记录。
+ */
+test.describe("在途保存不污染新建的编辑器", () => {
+  test("create 在 newPrompt 之后返回时不写回 currentId/title", async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "create_prompt") {
+            await new Promise((resolve) => window.setTimeout(resolve, 500));
+            return {
+              id: "prompt-a",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-01-01 00:00:00",
+              updated_at: "2026-01-01 00:00:00",
+              last_used_at: null,
+            };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("A 的内容");
+
+    await page.getByRole("button", { name: "保存", exact: true }).click();
+    await page.locator("aside button", { hasText: "新建 Prompt" }).click();
+    await page.getByRole("button", { name: "丢弃并新建" }).click();
+
+    // 等 create 的 500ms 延迟返回：它属于上一个编辑会话，不能挂回当前编辑器。
+    await page.waitForTimeout(800);
+    await expect(textarea).toHaveValue("");
+    await expect(page.getByText("A 的内容")).toHaveCount(0);
+  });
+});
+
+/**
+ * 润色结果跨 Prompt 串写的回归测试。
+ *
+ * PromptEditor 在编辑器内用 ⌘K 切换 Prompt 时不会卸载，旧实现会把 A 的润色结果
+ * 留在面板里，点「替换原文」就写进 B。这里通过全局搜索切换，确保组件不卸载。
+ */
+test.describe("润色结果随编辑目标切换清空", () => {
+  const promptB = {
+    id: "prompt-b",
+    title: "B 的标题",
+    content: "B 的正文",
+    optimized_content: null,
+    category: null,
+    summary: null,
+    is_favorite: false,
+    created_at: "2026-01-01 00:00:00",
+    updated_at: "2026-01-01 00:00:00",
+    last_used_at: null,
+  };
+
+  test("切到另一条 Prompt 后旧结果消失", async ({ page }) => {
+    await page.addInitScript((b) => {
+      const calls: { cmd: string }[] = [];
+      (window as unknown as { __polishCalls: { cmd: string }[] }).__polishCalls = calls;
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          calls.push({ cmd });
+          if (cmd === "list_api_configs") {
+            return [
+              {
+                id: "cfg",
+                name: "测试配置",
+                provider: "Mimo",
+                base_url: "https://example.test",
+                model: "mimo",
+                is_active: true,
+                created_at: "2026-01-01T00:00:00Z",
+                updated_at: "2026-01-01T00:00:00Z",
+              },
+            ];
+          }
+          if (cmd === "list_prompts") return [];
+          if (cmd === "get_prompt") return b;
+          if (cmd === "get_prompt_tags") return [];
+          if (cmd === "search_prompts") {
+            return [
+              {
+                id: b.id,
+                title: b.title,
+                summary: b.content,
+                category: null,
+                tags: [],
+                updated_at: b.updated_at,
+                is_favorite: false,
+              },
+            ];
+          }
+          if (cmd === "polish_prompt_stream") return null;
+          if (cmd === "polish_prompt") return "A 的润色结果";
+          if (cmd === "analyze_polish_process") return [];
+          if (cmd === "create_prompt") {
+            return { ...b, id: "prompt-a", title: args?.title ?? "", content: args?.content ?? "" };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    }, promptB);
+
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("A 的内容");
+    await page.getByRole("button", { name: /开始润色/ }).click();
+    await expect(page.getByText("A 的润色结果")).toBeVisible();
+
+    await page.keyboard.press("Meta+k");
+    await page.getByRole("combobox").fill("B");
+    await page.getByRole("option", { name: /B 的标题/ }).click();
+
+    await expect(page.locator("textarea").first()).toHaveValue("B 的正文");
+    await expect(page.getByText("A 的润色结果")).toHaveCount(0);
+  });
+});
+
+/**
+ * 弹窗打开时全局快捷键必须失效，否则搜索框里的 ⌘↵ 会发起一次真实计费调用。
+ */
+test.describe("弹窗内全局快捷键隔离", () => {
+  test("搜索弹窗打开时 ⌘↵ 不触发润色", async ({ page }) => {
+    await page.addInitScript(() => {
+      const calls: { cmd: string }[] = [];
+      (window as unknown as { __polishCalls: { cmd: string }[] }).__polishCalls = calls;
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          calls.push({ cmd });
+          if (cmd === "list_api_configs") {
+            return [
+              {
+                id: "cfg",
+                name: "测试配置",
+                provider: "Mimo",
+                base_url: "https://example.test",
+                model: "mimo",
+                is_active: true,
+                created_at: "2026-01-01T00:00:00Z",
+                updated_at: "2026-01-01T00:00:00Z",
+              },
+            ];
+          }
+          if (cmd === "list_prompts" || cmd === "search_prompts") return [];
+          if (cmd === "polish_prompt_stream") return null;
+          if (cmd === "polish_prompt") return "润色完成";
+          if (cmd === "analyze_polish_process") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("需要润色的内容");
+
+    await page.keyboard.press("Meta+k");
+    await expect(page.getByRole("combobox")).toBeVisible();
+    await page.keyboard.press("Meta+Enter");
+    await page.waitForTimeout(300);
+
+    let polishCalls = await page.evaluate(() => {
+      const all = (window as unknown as { __polishCalls: { cmd: string }[] }).__polishCalls;
+      return all.filter((c) => c.cmd === "polish_prompt" || c.cmd === "polish_prompt_stream");
+    });
+    expect(polishCalls, "弹窗打开时不应发起润色").toHaveLength(0);
+
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Meta+Enter");
+    await expect(page.getByText("润色完成")).toBeVisible();
+    polishCalls = await page.evaluate(() => {
+      const all = (window as unknown as { __polishCalls: { cmd: string }[] }).__polishCalls;
+      return all.filter((c) => c.cmd === "polish_prompt" || c.cmd === "polish_prompt_stream");
+    });
+    expect(polishCalls.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * 自动保存只在内容真正变化时写入：加载一条 Prompt 不应在 3 秒后
+ * 改写它的 updated_at（那会把记录顶到列表最前）。
+ */
+test.describe("自动保存脏检查", () => {
+  test("仅打开 Prompt 不会触发保存", async ({ page }) => {
+    await page.addInitScript(() => {
+      const calls: { cmd: string }[] = [];
+      (window as unknown as { __saveCalls: { cmd: string }[] }).__saveCalls = calls;
+      const prompt = {
+        id: "prompt-b",
+        title: "B 的标题",
+        content: "B 的正文",
+        optimized_content: null,
+        category: null,
+        summary: null,
+        is_favorite: false,
+        created_at: "2026-01-01 00:00:00",
+        updated_at: "2026-01-01 00:00:00",
+        last_used_at: null,
+      };
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          calls.push({ cmd });
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [prompt];
+          if (cmd === "get_prompt") return prompt;
+          if (cmd === "get_prompt_tags") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await page.getByRole("button", { name: /B 的标题/ }).click();
+    await expect(page.locator("textarea").first()).toHaveValue("B 的正文");
+
+    await page.waitForTimeout(3500);
+    const saves = await page.evaluate(() =>
+      (window as unknown as { __saveCalls: { cmd: string }[] }).__saveCalls.filter(
+        (c) => c.cmd === "update_prompt" || c.cmd === "create_prompt"
+      )
+    );
+    expect(saves, "未修改的内容不应触发保存").toHaveLength(0);
+  });
+});
+
+/**
+ * 自动保存失败必须可见且能自愈：首次 create 失败显示横幅，重试成功后横幅消失。
+ */
+test.describe("自动保存失败与重试", () => {
+  test("失败时显示错误横幅，重试成功后自动消失", async ({ page }) => {
+    await page.addInitScript(() => {
+      let createAttempts = 0;
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string, args?: Record<string, unknown>) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [];
+          if (cmd === "create_prompt") {
+            createAttempts += 1;
+            if (createAttempts === 1) {
+              throw new Error("database is locked");
+            }
+            return {
+              id: "prompt-1",
+              title: args?.title ?? "",
+              content: args?.content ?? "",
+              optimized_content: null,
+              category: null,
+              summary: null,
+              is_favorite: false,
+              created_at: "2026-01-01 00:00:00",
+              updated_at: "2026-01-01 00:00:00",
+              last_used_at: null,
+            };
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("textarea").first().fill("自动保存失败重试的内容");
+
+    const alert = page.getByRole("alert").filter({ hasText: "保存失败" });
+    await expect(alert).toBeVisible({ timeout: 6000 });
+
+    // 首次失败后按 6s 退避重试；成功后 store 清除 saveError。
+    await expect(alert).toHaveCount(0, { timeout: 15000 });
+  });
+});
+
+/**
+ * 全局搜索弹窗的生命周期：清空输入/关闭后不能残留上一轮结果。
+ */
+test.describe("全局搜索弹窗状态清理", () => {
+  test("清空输入与重新打开都不显示旧结果", async ({ page }) => {
+    await page.addInitScript(() => {
+      const prompt = {
+        id: "prompt-b",
+        title: "B 的标题",
+        content: "B 的正文",
+        optimized_content: null,
+        category: null,
+        summary: null,
+        is_favorite: false,
+        created_at: "2026-01-01 00:00:00",
+        updated_at: "2026-01-01 00:00:00",
+        last_used_at: null,
+      };
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [prompt];
+          if (cmd === "search_prompts") {
+            return [
+              {
+                id: prompt.id,
+                title: prompt.title,
+                summary: prompt.content,
+                category: null,
+                tags: [],
+                updated_at: prompt.updated_at,
+                is_favorite: false,
+              },
+            ];
+          }
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    // 等应用挂载完成再按快捷键：keydown 监听是在首屏渲染后注册的。
+    await expect(page.locator("textarea").first()).toBeVisible();
+    await page.keyboard.press("Meta+k");
+    const input = page.getByRole("combobox");
+    await expect(input).toBeVisible();
+    await input.fill("B");
+    await expect(page.getByRole("option", { name: /B 的标题/ })).toBeVisible();
+
+    await input.fill("");
+    await expect(page.getByText("输入关键词开始搜索")).toBeVisible();
+    await expect(page.getByRole("option")).toHaveCount(0);
+
+    await page.keyboard.press("Escape");
+    await expect(input).toHaveCount(0);
+    await page.keyboard.press("Meta+k");
+    await expect(input).toBeVisible();
+    await expect(page.getByText("输入关键词开始搜索")).toBeVisible();
+    await expect(page.getByRole("option")).toHaveCount(0);
+  });
+});
+
+/**
+ * 详情页读取失败不能无限转圈，必须给出原因和退路。
+ */
+test.describe("详情页读取失败", () => {
+  test("显示错误状态与返回入口，而不是永久 spinner", async ({ page }) => {
+    await page.addInitScript(() => {
+      const prompt = {
+        id: "prompt-b",
+        title: "B 的标题",
+        content: "B 的正文",
+        optimized_content: null,
+        category: null,
+        summary: null,
+        is_favorite: false,
+        created_at: "2026-01-01 00:00:00",
+        updated_at: "2026-01-01 00:00:00",
+        last_used_at: null,
+      };
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [prompt];
+          if (cmd === "get_prompt") throw new Error("数据库暂时不可用");
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("nav button", { hasText: "全部 Prompt" }).click();
+    await page.getByRole("button", { name: "详情" }).click();
+
+    await expect(page.getByText("加载 Prompt 失败")).toBeVisible();
+    await expect(page.getByText("数据库暂时不可用").first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "重试" }).first()).toBeVisible();
+    await expect(page.getByRole("button", { name: "返回列表" })).toBeVisible();
+  });
+});
+
+/**
+ * 设置页读取失败不能伪装成「暂无 API 配置」。
+ */
+test.describe("设置页读取失败", () => {
+  test("显示失败原因和重试入口，而不是空状态", async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") throw new Error("database is locked");
+          if (cmd === "list_prompts") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
+
+    await page.goto(BASE);
+    await page.locator("aside button", { hasText: "设置" }).click();
+
+    await expect(page.getByRole("alert").filter({ hasText: "读取 API 配置失败" })).toBeVisible();
+    await expect(page.getByText("暂无 API 配置")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
   });
 });
