@@ -7,7 +7,7 @@ PromptDock 是一款运行在 macOS 上的本地提示词管理工具，支持 P
 安装包位于项目的 `release/` 目录：
 
 ```text
-release/PromptDock_0.1.0_universal_adhoc.dmg
+release/PromptDock_0.1.1_universal_adhoc.dmg
 ```
 
 双击打开 DMG 文件。
