@@ -45,7 +45,7 @@ pub(crate) fn search_prompts_impl(
 fn recent_prompts(conn: &Connection) -> Result<Vec<SearchResult>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT p.id, p.title, p.summary, p.category, p.updated_at
+            "SELECT p.id, p.title, p.summary, p.category, p.updated_at, p.is_favorite
              FROM prompts p ORDER BY COALESCE(p.last_used_at, p.updated_at) DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -57,7 +57,7 @@ fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, Strin
     let fts_query = build_fts_query(query);
     let mut stmt = conn
         .prepare(
-            "SELECT p.id, p.title, p.summary, p.category, p.updated_at
+            "SELECT p.id, p.title, p.summary, p.category, p.updated_at, p.is_favorite
              FROM prompts_fts fts
              INNER JOIN prompts p ON p.rowid = fts.rowid
              WHERE prompts_fts MATCH ?1
@@ -101,7 +101,7 @@ fn like_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, Stri
     params.push(Box::new(SEARCH_RESULT_LIMIT as i64));
 
     let sql = format!(
-        "SELECT id, title, summary, category, updated_at FROM prompts
+        "SELECT id, title, summary, category, updated_at, is_favorite FROM prompts
          WHERE {}
          ORDER BY updated_at DESC LIMIT ?{}",
         clauses.join(" AND "),
@@ -131,7 +131,9 @@ fn attach_tags(conn: &Connection, results: &mut [SearchResult]) -> Result<(), St
     let mut tag_stmt = conn.prepare(&tag_sql).map_err(|e| e.to_string())?;
     let tag_rows: Vec<(String, String)> = tag_stmt
         .query_map(
-            rusqlite::params_from_iter(results.iter().map(|r| &r.id as &dyn rusqlite::types::ToSql)),
+            rusqlite::params_from_iter(
+                results.iter().map(|r| &r.id as &dyn rusqlite::types::ToSql),
+            ),
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|e| e.to_string())?
@@ -161,6 +163,7 @@ fn row_to_search_result(row: &rusqlite::Row) -> rusqlite::Result<SearchResult> {
         category: row.get(3)?,
         tags: Vec::new(),
         updated_at: row.get(4)?,
+        is_favorite: row.get(5)?,
     })
 }
 

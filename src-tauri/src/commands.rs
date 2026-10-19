@@ -18,8 +18,23 @@ pub fn create_prompt(
     optimized_content: Option<String>,
 ) -> Result<Prompt, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
+    create_prompt_impl(&conn, title, content, optimized_content)
+}
+
+fn create_prompt_impl(
+    conn: &Connection,
+    title: String,
+    content: String,
+    optimized_content: Option<String>,
+) -> Result<Prompt, String> {
+    // 空记录在列表里既没有标题也没有内容，只能显示「未命名」，用户无法找回。
+    // 前端已拦截，但 IPC 不是可信边界，迟到的保存队列也可能传空值。
+    if title.trim().is_empty() && content.trim().is_empty() {
+        return Err("Prompt 内容不能为空".to_string());
+    }
+
     let id = Uuid::new_v4().to_string();
-    let now = conn_now(&conn);
+    let now = conn_now(conn);
 
     conn.execute(
         "INSERT INTO prompts (id, title, content, optimized_content, created_at, updated_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -50,13 +65,30 @@ pub fn update_prompt(
     optimized_content: Option<String>,
 ) -> Result<(), String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let now = conn_now(&conn);
+    update_prompt_impl(&conn, &id, &title, &content, optimized_content)
+}
 
-    conn.execute(
-        "UPDATE prompts SET title = ?1, content = ?2, optimized_content = ?3, updated_at = ?4 WHERE id = ?5",
-        rusqlite::params![title, content, optimized_content, now, id],
-    )
-    .map_err(|e| e.to_string())?;
+fn update_prompt_impl(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    optimized_content: Option<String>,
+) -> Result<(), String> {
+    let now = conn_now(conn);
+
+    let affected = conn
+        .execute(
+            "UPDATE prompts SET title = ?1, content = ?2, optimized_content = ?3, updated_at = ?4 WHERE id = ?5",
+            rusqlite::params![title, content, optimized_content, now, id],
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 记录已被删除 / 数据库被重置时必须报错。否则自动保存和 ⌘S 都会
+    // 显示「已保存」，实际写入 0 行，用户的数据静默丢失。
+    if affected == 0 {
+        return Err("Prompt 不存在".to_string());
+    }
 
     Ok(())
 }
@@ -159,11 +191,22 @@ pub fn record_prompt_use(state: State<DbState>, id: String) -> Result<(), String
 #[tauri::command]
 pub fn toggle_favorite(state: State<DbState>, id: String) -> Result<bool, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "UPDATE prompts SET is_favorite = CASE WHEN is_favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
-        rusqlite::params![id],
-    )
-    .map_err(|e| e.to_string())?;
+    toggle_favorite_impl(&conn, &id)
+}
+
+fn toggle_favorite_impl(conn: &Connection, id: &str) -> Result<bool, String> {
+    let affected = conn
+        .execute(
+            "UPDATE prompts SET is_favorite = CASE WHEN is_favorite = 1 THEN 0 ELSE 1 END WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+
+    // 不存在的 id 不应该走到 query_row，否则用户看到的是
+    // "Query returned no rows" 这种泄露实现的英文错误。
+    if affected == 0 {
+        return Err("Prompt 不存在".to_string());
+    }
 
     let fav: i32 = conn
         .query_row(
@@ -310,7 +353,8 @@ pub fn apply_classification(
 ) -> Result<Vec<Tag>, String> {
     let mut conn = state.0.lock().map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let tags = apply_classification_impl(&tx, &id, &category, &summary, &recommended_tool, &tag_names)?;
+    let tags =
+        apply_classification_impl(&tx, &id, &category, &summary, &recommended_tool, &tag_names)?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(tags)
 }
@@ -335,11 +379,17 @@ fn apply_classification_impl(
         return Err("Prompt 不存在".to_string());
     }
 
-    // 推荐工具排在最前，超出上限时优先保留它。
+    // 推荐工具排在最前，超出上限时优先保留它。`replace_prompt_tags` 会直接
+    // 丢弃超过 TAG_MAX_CHARS 的名字，所以这里先按字符截断 —— 否则
+    // "Microsoft Copilot" 这类 17 字符的工具名会无声消失。
     let mut names: Vec<String> = Vec::with_capacity(tag_names.len() + 1);
-    let tool = recommended_tool.trim();
+    let tool: String = recommended_tool
+        .trim()
+        .chars()
+        .take(TAG_MAX_CHARS)
+        .collect();
     if !tool.is_empty() {
-        names.push(tool.to_string());
+        names.push(tool);
     }
     for name in tag_names {
         let trimmed = name.trim();
@@ -457,6 +507,34 @@ mod tests {
     }
 
     #[test]
+    fn search_results_carry_favorite_flag() {
+        // 搜索结果此前不返回 is_favorite，前端只能硬编码 false，
+        // 同一条 Prompt 在「全部」里有星标、搜索出来星标消失。
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "视频脚本", "帮我写一个关于 AI 的视频脚本");
+        insert_prompt(&conn, "p2", "视频剪辑", "整理素材");
+        conn.execute("UPDATE prompts SET is_favorite = 1 WHERE id = 'p2'", [])
+            .expect("favorite p2");
+
+        // CJK → LIKE 路径
+        let results = search_prompts_impl(&conn, "视频").expect("like search");
+        let favorite_of = |id: &str| results.iter().find(|r| r.id == id).unwrap().is_favorite;
+        assert!(!favorite_of("p1"));
+        assert!(favorite_of("p2"));
+
+        // 纯 ASCII → FTS 路径
+        let results = search_prompts_impl(&conn, "AI").expect("fts search");
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].is_favorite);
+
+        // 空查询 → 最近使用路径
+        let results = search_prompts_impl(&conn, "").expect("recent");
+        let favorite_of = |id: &str| results.iter().find(|r| r.id == id).unwrap().is_favorite;
+        assert!(favorite_of("p2"));
+        assert!(!favorite_of("p1"));
+    }
+
+    #[test]
     fn multi_term_chinese_query_is_not_dropped_by_fts_and_semantics() {
         // 回归测试：FTS 下 `"AI"* "视频"*` 是隐式 AND，「视频」必然落空 → 零结果。
         let conn = test_conn();
@@ -481,7 +559,11 @@ mod tests {
 
         let results = search_prompts_impl(&conn, "视频").expect("search");
 
-        assert_eq!(results.len(), 2, "两条都含「视频」，不应只召回 FTS 命中的那条");
+        assert_eq!(
+            results.len(),
+            2,
+            "两条都含「视频」，不应只召回 FTS 命中的那条"
+        );
     }
 
     #[test]
@@ -576,6 +658,21 @@ mod tests {
     // ------------------ Tags ------------------
 
     #[test]
+    fn apply_classification_truncates_an_overlong_recommended_tool_instead_of_dropping_it() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+
+        // 17 个字符，超过 TAG_MAX_CHARS(15)。旧实现会直接丢弃这个标签，
+        // 与「推荐工具优先保留」的注释相矛盾。
+        let tags = apply_classification_impl(&conn, "p1", "分类", "摘要", "Microsoft Copilot", &[])
+            .expect("classify");
+
+        assert_eq!(tags.len(), 1, "推荐工具不应被丢弃");
+        assert_eq!(tags[0].name.chars().count(), TAG_MAX_CHARS);
+        assert!(tags[0].name.starts_with("Microsoft"));
+    }
+
+    #[test]
     fn apply_classification_keeps_the_recommended_tool_tag() {
         // 回归测试：以前 recommended_tool 先被写成标签，紧接着前端调用的
         // set_prompt_tags 会 DELETE 该 Prompt 的全部标签，于是这个标签从未真正
@@ -637,7 +734,8 @@ mod tests {
         let conn = test_conn();
         insert_prompt(&conn, "p1", "标题", "内容");
 
-        apply_classification_impl(&conn, "p1", "代码开发", "写一个脚本", "", &[]).expect("classify");
+        apply_classification_impl(&conn, "p1", "代码开发", "写一个脚本", "", &[])
+            .expect("classify");
 
         let (category, summary): (Option<String>, Option<String>) = conn
             .query_row(
@@ -687,7 +785,11 @@ mod tests {
         let tags =
             apply_classification_impl(&conn, "p1", "分类", "摘要", "", &names).expect("classify");
 
-        assert!(tags.len() <= TAG_MAX_COUNT, "标签数量应被限制: {}", tags.len());
+        assert!(
+            tags.len() <= TAG_MAX_COUNT,
+            "标签数量应被限制: {}",
+            tags.len()
+        );
         assert!(
             tags.iter().all(|t| t.name.chars().count() <= TAG_MAX_CHARS),
             "超长标签应被丢弃而不是截断"
@@ -723,5 +825,51 @@ mod tests {
         // 引号被剥离，避免用户注入 FTS5 查询语法
         assert_eq!(build_fts_query("a\"b"), "\"ab\"*");
         assert_eq!(build_fts_query("   "), "   ");
+    }
+
+    // ------------------ Write-path validation ------------------
+
+    #[test]
+    fn create_prompt_rejects_completely_empty_input() {
+        let conn = test_conn();
+
+        let err = create_prompt_impl(&conn, String::new(), "  \n ".to_string(), None)
+            .expect_err("完全空白的 Prompt 不应落库");
+        assert_eq!(err, "Prompt 内容不能为空");
+
+        // 只有标题或只有正文都是合法输入。
+        assert!(create_prompt_impl(&conn, "只有标题".to_string(), String::new(), None).is_ok());
+        assert!(create_prompt_impl(&conn, String::new(), "只有正文".to_string(), None).is_ok());
+    }
+
+    #[test]
+    fn update_prompt_errors_when_the_row_no_longer_exists() {
+        // 回归测试：旧实现不检查 affected，删除后迟到的自动保存会「成功」
+        // 返回，用户看到已保存但 0 行被更新。
+        let conn = test_conn();
+
+        let err = update_prompt_impl(&conn, "missing", "标题", "内容", None)
+            .expect_err("更新不存在的记录必须报错");
+        assert_eq!(err, "Prompt 不存在");
+    }
+
+    #[test]
+    fn toggle_favorite_errors_with_a_readable_message_for_unknown_id() {
+        let conn = test_conn();
+
+        let err = toggle_favorite_impl(&conn, "missing").expect_err("收藏不存在的记录必须报错");
+        assert_eq!(
+            err, "Prompt 不存在",
+            "不应泄露 rusqlite 的 QueryReturnedNoRows"
+        );
+    }
+
+    #[test]
+    fn toggle_favorite_round_trips_the_flag() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+
+        assert!(toggle_favorite_impl(&conn, "p1").expect("favorite"));
+        assert!(!toggle_favorite_impl(&conn, "p1").expect("unfavorite"));
     }
 }

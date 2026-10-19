@@ -10,21 +10,65 @@ const DB_FILENAME: &str = "promptdock.db";
 /// 1 = 已确保 FTS 索引与 `prompts` 表一致。
 const SCHEMA_VERSION: i64 = 1;
 
-pub fn get_db_path(app_handle: &tauri::AppHandle) -> PathBuf {
+pub fn get_db_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // 失败时不能回退到当前目录：那可能把含明文 Key 的数据库写进下载目录、
+    // 同步盘或仓库目录。宁可直接报错退出。
     let app_dir = app_handle
         .path()
         .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    if let Err(e) = fs::create_dir_all(&app_dir) {
-        eprintln!("Failed to create app data directory: {}", e);
+        .map_err(|e| format!("无法定位应用数据目录: {}", e))?;
+
+    fs::create_dir_all(&app_dir)
+        .map_err(|e| format!("无法创建应用数据目录 {}: {}", app_dir.display(), e))?;
+
+    // 数据库里有明文 API Key，目录只允许当前用户访问。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("无法设置应用数据目录权限: {}", e))?;
     }
-    app_dir.join(DB_FILENAME)
+
+    Ok(app_dir.join(DB_FILENAME))
 }
 
 pub fn init_db(db_path: &Path) -> SqliteResult<Connection> {
+    restrict_db_permissions(db_path);
     let conn = Connection::open(db_path)?;
+    // A brand-new database file was created by the open above with umask
+    // permissions; tighten it before the first write creates the WAL sidecar
+    // (SQLite gives the sidecars the database file's mode).
+    restrict_db_permissions(db_path);
+    // Without a busy timeout, any concurrent writer (a second app instance or an
+    // external sqlite tool) makes the next write fail immediately with
+    // "database is locked". Wait briefly instead.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     init_schema(&conn)?;
     Ok(conn)
+}
+
+/// Keeps the database and its WAL sidecars readable only by the current user.
+///
+/// SQLite creates `-wal` / `-shm` with the database file's permissions, so the
+/// chmod has to run before opening the connection (and cover sidecars created
+/// by a previous run).
+fn restrict_db_permissions(db_path: &Path) {
+    #[cfg(not(unix))]
+    let _ = db_path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::Permissions::from_mode(0o600);
+        for path in [
+            db_path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ] {
+            if path.exists() {
+                let _ = fs::set_permissions(&path, mode.clone());
+            }
+        }
+    }
 }
 
 /// Creates tables, indexes and FTS5 triggers on an already-open connection.
@@ -74,8 +118,8 @@ pub fn init_schema(conn: &Connection) -> SqliteResult<()> {
         );",
     )?;
 
-    ensure_column(conn,"prompts", "last_used_at", "TEXT")?;
-    ensure_column(conn,"api_configs", "api_key", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "prompts", "last_used_at", "TEXT")?;
+    ensure_column(conn, "api_configs", "api_key", "TEXT NOT NULL DEFAULT ''")?;
     conn.execute(
         "UPDATE prompts SET last_used_at = updated_at WHERE last_used_at IS NULL",
         [],
