@@ -1,1 +1,1 @@
-a983a46b939ff3874ef12d4c15dcc1f66b36c6373cec358336849a2286dad078  PromptDock_0.1.1_universal_adhoc.dmg
+1e55e19c6dff60ce9e4e914ff53a8c83bb45a40cc43b33b2e482e8ae43f66fc7  PromptDock_0.1.1_universal.dmg
