@@ -4,6 +4,7 @@ import { hasTauriInvoke } from "@/lib/tauriRuntime";
 import { createLatestOnlyGuard } from "@/lib/latestOnly";
 import type {
   Prompt,
+  PromptSummary,
   SearchResult,
   ClassifyResult,
   PolishMode,
@@ -32,7 +33,10 @@ interface PromptState {
    */
   editSession: number;
 
-  prompts: Prompt[];
+  /** 不受当前列表筛选影响的全局摘要，供统计、分类计数和最近使用使用。 */
+  allPrompts: PromptSummary[];
+  /** 当前列表筛选结果；正文只含后端生成的预览。 */
+  prompts: PromptSummary[];
   searchResults: SearchResult[];
   searchQuery: string;
   selectedCategory: string | null;
@@ -65,6 +69,7 @@ interface PromptState {
   setContent: (content: string) => void;
   setOptimizedContent: (content: string | null) => void;
 
+  loadAllPrompts: () => Promise<void>;
   loadPrompts: () => Promise<void>;
   search: (query: string) => Promise<void>;
   setSearchQuery: (query: string) => void;
@@ -85,7 +90,7 @@ interface PromptState {
     onDelta: (delta: string) => void
   ) => Promise<string>;
   cancelPolishStream: () => Promise<void>;
-  autoClassify: () => Promise<ClassifyResult>;
+  autoClassify: (categories: string[]) => Promise<ClassifyResult>;
   applyClassifyResult: (result: ClassifyResult) => Promise<void>;
 }
 
@@ -95,12 +100,19 @@ interface PolishStreamEvent {
   content?: string;
 }
 
-// 三类相互独立的异步读取，各自需要「最新者胜」。用同一个守卫会让列表刷新
-// 把在途的搜索或详情加载误判为过期。
+// 各异步读取独立持有「最新者胜」守卫，避免一种刷新误伤另一种在途请求。
+const beginAllListLoad = createLatestOnlyGuard();
 const beginListLoad = createLatestOnlyGuard();
 const beginPromptLoad = createLatestOnlyGuard();
 const beginSearch = createLatestOnlyGuard();
 const beginPolishStream = createLatestOnlyGuard();
+const beginClassification = createLatestOnlyGuard();
+
+/** autoClassify 与 applyClassifyResult 之间保留发起时的编辑目标。 */
+const classificationContexts = new WeakMap<
+  ClassifyResult,
+  { id: string | null; session: number }
+>();
 
 /**
  * 保存串行化队列。自动保存（3s 防抖）和 ⌘S 可能同时发起：两个请求都读到
@@ -158,6 +170,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   summary: null,
   tags: [],
   isFavorite: false,
+  allPrompts: [],
   prompts: [],
   searchResults: [],
   searchQuery: "",
@@ -176,7 +189,8 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   newPrompt: () => {
     // 先作废在途的 loadPrompt，否则它的迟到响应会在清空之后把编辑器写回旧 Prompt。
     beginPromptLoad();
-    // 编辑目标变了，在途的流式润色一并取消。
+    // 分类与流式润色都绑定旧编辑目标，切换后立即作废并解除按钮阻塞。
+    beginClassification();
     void get().cancelPolishStream();
     set({
       currentId: null,
@@ -187,6 +201,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
       summary: null,
       tags: [],
       isFavorite: false,
+      isClassifying: false,
       savedSnapshot: { title: "", content: "" },
       // 用户已明确丢弃上一条内容，之前的保存失败提示不再有意义。
       saveError: null,
@@ -203,6 +218,12 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   loadPrompt: async (id: string) => {
     if (!hasTauriInvoke()) return;
 
+    // 必须在 dirty flush 之前启动守卫并绑定会话：flush 等待期间用户可能新建，
+    // 这次旧加载随后既不能发详情请求，也不能覆盖新编辑器。
+    const isLatest = beginPromptLoad();
+    const session = get().editSession;
+    const isCurrentLoad = () => isLatest() && get().editSession === session;
+
     // 切换编辑目标前先把还没到 3 秒防抖的修改落库。loadPrompt 会替换
     // title/content，effect cleanup 随即清掉自动保存 timer，不 flush 就永久丢失。
     // 保存失败时保持当前编辑器内容不变，避免用户以为已经切换成功。
@@ -214,22 +235,21 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         // 不要让用户以为已经切换成功。
         return;
       }
+      if (!isCurrentLoad()) return;
     }
 
     // 切换编辑目标时取消在途的流式润色，结果不该写进新打开的 Prompt。
     void get().cancelPolishStream();
 
-    // 快速连续打开两条 Prompt 时，慢的旧响应会把 currentId 写回旧 id，
-    // 详情页因此永远等不到匹配的 id 而卡在 spinner。
-    const isLatest = beginPromptLoad();
-
     try {
       const prompt = await invoke<Prompt>("get_prompt", { id });
+      if (!isCurrentLoad()) return;
       const tags = await invoke<{ id: string; name: string }[]>("get_prompt_tags", {
         promptId: id,
       });
-      if (!isLatest()) return;
+      if (!isCurrentLoad()) return;
 
+      beginClassification();
       set({
         currentId: prompt.id,
         title: prompt.title,
@@ -242,12 +262,13 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         savedSnapshot: { title: prompt.title, content: prompt.content },
         error: null,
         saveError: null,
+        isClassifying: false,
         // 加载完成才算真正切换：失败时不 bump，编辑器仍属于上一条 Prompt。
         editSession: get().editSession + 1,
       });
       await get().recordPromptUse(id);
     } catch (e) {
-      if (!isLatest()) return;
+      if (!isCurrentLoad()) return;
       const msg = getErrorMessage(e);
       console.error("Failed to load prompt:", msg);
       set({ error: msg });
@@ -256,8 +277,9 @@ export const usePromptStore = create<PromptState>((set, get) => ({
 
   savePrompt: () => {
     if (!hasTauriInvoke()) {
-      set({ error: "PromptDock desktop runtime is unavailable" });
-      return Promise.resolve();
+      const error = new Error("PromptDock desktop runtime is unavailable");
+      set({ saveError: `保存失败：${error.message}` });
+      return Promise.reject(error);
     }
 
     // 记录这次保存属于哪个编辑会话。排队/网络等待期间用户可能新建或切到
@@ -266,13 +288,14 @@ export const usePromptStore = create<PromptState>((set, get) => ({
     const session = get().editSession;
     const seq = ++saveRequestSeq;
 
-    // 串行执行（原因见 saveQueue 声明处）。注意读 get() 的时机在执行时而不是
-    // 入队时：排队期间状态可能已被前一个保存或用户输入改变。
+    // 串行执行（原因见 saveQueue 声明处）。快照必须在真正执行时获取：
+    // 排队期间状态可能已被前一个保存或用户输入改变。
     const run = saveQueue.then(async () => {
       // 入队后编辑目标已切换：这次保存的数据不再属于当前会话，跳过。
       if (session !== get().editSession) return;
 
       const { currentId, title, content, optimizedContent } = get();
+      const snapshot = { title, content };
       // 新建且完全空白时不落库：保存队列的迟到执行不应生成空记录。
       if (!currentId && !title.trim() && !content.trim()) return;
 
@@ -282,6 +305,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
 
       set({ isSaving: true });
       try {
+        let savedId = currentId;
         if (currentId) {
           await invoke("update_prompt", {
             id: currentId,
@@ -289,29 +313,26 @@ export const usePromptStore = create<PromptState>((set, get) => ({
             content,
             optimizedContent,
           });
-          // 写入已经落在旧记录上是对的，但状态回写必须属于同一会话。
-          if (session !== get().editSession) return;
-          set({
-            title: effectiveTitle,
-            savedSnapshot: { title: effectiveTitle, content },
-            saveError: null,
-          });
         } else {
           const prompt = await invoke<Prompt>("create_prompt", {
             title: effectiveTitle,
             content,
             optimizedContent,
           });
-          // 创建期间用户已新建/切换：记录保留（内容没有丢），但不要把它
-          // 重新挂回当前编辑器。
-          if (session !== get().editSession) return;
-          set({
-            currentId: prompt.id,
-            title: effectiveTitle,
-            savedSnapshot: { title: effectiveTitle, content },
-            saveError: null,
-          });
+          savedId = prompt.id;
         }
+
+        // 落库的是执行时的快照。响应期间同一会话里的新输入必须保留并保持 dirty；
+        // 只有标题未被继续编辑时，才把 trim/兜底后的标题同步到输入框。
+        if (session === get().editSession) {
+          set((state) => ({
+            currentId: savedId,
+            title: state.title === snapshot.title ? effectiveTitle : state.title,
+            savedSnapshot: { title: effectiveTitle, content: snapshot.content },
+            saveError: null,
+          }));
+        }
+        await Promise.all([get().loadAllPrompts(), get().loadPrompts()]);
       } catch (e) {
         if (session === get().editSession) {
           set({ saveError: `保存失败：${getErrorMessage(e)}` });
@@ -333,6 +354,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
 
     try {
       await invoke("delete_prompt", { id });
+      await Promise.all([get().loadAllPrompts(), get().loadPrompts()]);
       const { currentId } = get();
       if (currentId === id) {
         get().newPrompt();
@@ -349,7 +371,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
 
     try {
       await invoke("record_prompt_use", { id });
-      await get().loadPrompts();
+      await Promise.all([get().loadAllPrompts(), get().loadPrompts()]);
     } catch (e) {
       // 「最近使用」只是个统计，失败不该打断用户，也不值得弹横幅。
       console.error("Failed to record prompt use:", getErrorMessage(e));
@@ -357,13 +379,17 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   },
 
   toggleFavorite: async () => {
-    const { currentId } = get();
+    const { currentId, editSession } = get();
     if (!currentId) return;
     if (!hasTauriInvoke()) return;
 
     try {
       const fav = await invoke<boolean>("toggle_favorite", { id: currentId });
-      set({ isFavorite: fav });
+      // 收藏写入的是发起时的记录；响应不能改到期间新打开的 Prompt 上。
+      if (get().currentId === currentId && get().editSession === editSession) {
+        set({ isFavorite: fav });
+      }
+      await Promise.all([get().loadAllPrompts(), get().loadPrompts()]);
     } catch (e) {
       console.error("Failed to toggle favorite:", getErrorMessage(e));
       throw e;
@@ -374,6 +400,28 @@ export const usePromptStore = create<PromptState>((set, get) => ({
   setContent: (content: string) => set({ content }),
   setOptimizedContent: (content: string | null) =>
     set({ optimizedContent: content }),
+
+  loadAllPrompts: async () => {
+    if (!hasTauriInvoke()) {
+      set({ allPrompts: [] });
+      return;
+    }
+
+    const isLatest = beginAllListLoad();
+    try {
+      const allPrompts = await invoke<PromptSummary[]>("list_prompts", {
+        category: null,
+        favoriteOnly: false,
+      });
+      if (!isLatest()) return;
+      set({ allPrompts, error: null });
+    } catch (e) {
+      if (!isLatest()) return;
+      const msg = getErrorMessage(e);
+      console.error("Failed to load all prompts:", msg);
+      set({ error: msg });
+    }
+  },
 
   loadPrompts: async () => {
     if (!hasTauriInvoke()) {
@@ -386,7 +434,7 @@ export const usePromptStore = create<PromptState>((set, get) => ({
 
     const { selectedCategory, favoriteOnly } = get();
     try {
-      const prompts = await invoke<Prompt[]>("list_prompts", {
+      const prompts = await invoke<PromptSummary[]>("list_prompts", {
         category: selectedCategory,
         favoriteOnly,
       });
@@ -510,6 +558,8 @@ export const usePromptStore = create<PromptState>((set, get) => ({
         return "";
       }
       if (isMissingStreamCommand(getErrorMessage(e))) {
+        // 缺失命令的异常可能在取消后才返回；此时不能再发一次真实计费请求。
+        if (!isCurrent()) return "";
         return await invoke<string>("polish_prompt", {
           content: sourceContent,
           mode,
@@ -542,30 +592,45 @@ export const usePromptStore = create<PromptState>((set, get) => ({
     }
   },
 
-  autoClassify: async () => {
+  autoClassify: async (categories: string[]) => {
+    const isLatest = beginClassification();
+    const { content, currentId, editSession } = get();
     set({ isClassifying: true });
     try {
-      const { content } = get();
-      return await invoke<ClassifyResult>("auto_classify", { content });
+      const result = await invoke<ClassifyResult>("auto_classify", { content, categories });
+      if (get().currentId !== currentId || get().editSession !== editSession) {
+        throw new Error("编辑目标已切换，已丢弃旧分类结果");
+      }
+      if (!isLatest()) {
+        throw new Error("已有新的分类请求，已丢弃旧分类结果");
+      }
+      classificationContexts.set(result, { id: currentId, session: editSession });
+      return result;
     } finally {
-      set({ isClassifying: false });
+      if (isLatest()) set({ isClassifying: false });
     }
   },
 
   applyClassifyResult: async (result: ClassifyResult) => {
-    const { currentId } = get();
-    if (!currentId) return;
-    if (!hasTauriInvoke()) return;
+    const context = classificationContexts.get(result);
+    if (!context?.id || !hasTauriInvoke()) return;
+    const { id, session } = context;
+    if (get().currentId !== id || get().editSession !== session) {
+      throw new Error("编辑目标已切换，已丢弃旧分类结果");
+    }
 
     // 单个命令、单个事务写入。以前拆成 update_prompt_meta + set_prompt_tags
     // 两步，第二步会清空全部标签，把第一步刚写入的推荐工具标签删掉。
     const tags = await invoke<{ id: string; name: string }[]>("apply_classification", {
-      id: currentId,
+      id,
       category: result.category,
       summary: result.summary,
       recommendedTool: result.recommended_tool,
       tagNames: result.tags,
     });
+    await Promise.all([get().loadAllPrompts(), get().loadPrompts()]);
+    // 后端可以完成旧记录的分类，但响应绝不能应用到期间新打开的 Prompt。
+    if (get().currentId !== id || get().editSession !== session) return;
     set({
       category: result.category,
       summary: result.summary,

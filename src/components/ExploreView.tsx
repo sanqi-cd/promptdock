@@ -1,4 +1,5 @@
 import { usePromptStore } from "@/stores/promptStore";
+import { useCategoryStore } from "@/stores/categoryStore";
 import { CATEGORIES } from "@/components/CategoryTags";
 import { CategoryIcon } from "@/lib/categoryIcons";
 import { formatDate } from "@/lib/formatDate";
@@ -22,7 +23,12 @@ const CARD_GRADIENTS = [
 ];
 
 export function ExploreView({ onSelectPrompt, onSelectCategory }: ExploreViewProps) {
-  const prompts = usePromptStore((s) => s.prompts);
+  const prompts = usePromptStore((s) => s.allPrompts);
+  const customCategories = useCategoryStore((s) => s.customCategories);
+  const categories = [
+    ...CATEGORIES,
+    ...customCategories.filter((cat) => !(CATEGORIES as readonly string[]).includes(cat)),
+  ];
 
   const categoryCounts: Record<string, number> = {};
   for (const p of prompts) {
@@ -52,7 +58,7 @@ export function ExploreView({ onSelectPrompt, onSelectCategory }: ExploreViewPro
         <section>
           <h2 className="text-[13px] font-semibold text-slate-300 mb-3">分类浏览</h2>
           <div className="grid grid-cols-2 gap-3">
-            {CATEGORIES.map((cat, i) => (
+            {categories.map((cat, i) => (
               <button
                 key={cat}
                 onClick={() => onSelectCategory(cat)}
@@ -106,7 +112,7 @@ export function ExploreView({ onSelectPrompt, onSelectCategory }: ExploreViewPro
                     </span>
                   </div>
                   <p className="text-[12px] text-slate-500 line-clamp-2 mt-0.5">
-                    {p.content.slice(0, 100)}
+                    {p.content_preview.slice(0, 100)}
                   </p>
                 </button>
               ))}

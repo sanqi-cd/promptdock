@@ -34,7 +34,7 @@ fn create_prompt_impl(
     }
 
     let id = Uuid::new_v4().to_string();
-    let now = conn_now(conn);
+    let now = conn_now(conn)?;
 
     conn.execute(
         "INSERT INTO prompts (id, title, content, optimized_content, created_at, updated_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -75,7 +75,7 @@ fn update_prompt_impl(
     content: &str,
     optimized_content: Option<String>,
 ) -> Result<(), String> {
-    let now = conn_now(conn);
+    let now = conn_now(conn)?;
 
     let affected = conn
         .execute(
@@ -107,8 +107,19 @@ fn delete_prompt_impl(conn: &Connection, id: &str) -> Result<(), String> {
         rusqlite::params![id],
     )
     .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM prompts WHERE id = ?1", rusqlite::params![id])
+    let affected = conn
+        .execute("DELETE FROM prompts WHERE id = ?1", rusqlite::params![id])
         .map_err(|e| e.to_string())?;
+    if affected == 0 {
+        return Err("Prompt 不存在".to_string());
+    }
+    conn.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM prompt_tags pt WHERE pt.tag_id = tags.id
+         )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -134,7 +145,7 @@ pub fn list_prompts(
     state: State<DbState>,
     category: Option<String>,
     favorite_only: Option<bool>,
-) -> Result<Vec<Prompt>, String> {
+) -> Result<Vec<PromptSummary>, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     list_prompts_impl(&conn, category, favorite_only)
 }
@@ -143,9 +154,9 @@ fn list_prompts_impl(
     conn: &Connection,
     category: Option<String>,
     favorite_only: Option<bool>,
-) -> Result<Vec<Prompt>, String> {
+) -> Result<Vec<PromptSummary>, String> {
     let mut sql = String::from(
-        "SELECT id, title, content, optimized_content, category, summary, is_favorite, created_at, updated_at, last_used_at FROM prompts WHERE 1=1",
+        "SELECT id, title, substr(content, 1, 200), category, summary, is_favorite, created_at, updated_at, last_used_at FROM prompts WHERE 1=1",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -157,13 +168,13 @@ fn list_prompts_impl(
         sql.push_str(" AND is_favorite = 1");
     }
 
-    sql.push_str(" ORDER BY updated_at DESC");
+    sql.push_str(" ORDER BY updated_at DESC, id");
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(
             rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            row_to_prompt,
+            row_to_prompt_summary,
         )
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -173,7 +184,7 @@ fn list_prompts_impl(
 #[tauri::command]
 pub fn record_prompt_use(state: State<DbState>, id: String) -> Result<(), String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let now = conn_now(&conn);
+    let now = conn_now(&conn)?;
     let affected = conn
         .execute(
             "UPDATE prompts SET last_used_at = ?1 WHERE id = ?2",
@@ -233,7 +244,7 @@ fn get_prompt_tags_impl(conn: &Connection, prompt_id: &str) -> Result<Vec<Tag>, 
             "SELECT t.id, t.name FROM tags t
              INNER JOIN prompt_tags pt ON t.id = pt.tag_id
              WHERE pt.prompt_id = ?1
-             ORDER BY t.name",
+             ORDER BY t.name, t.id",
         )
         .map_err(|e| e.to_string())?;
 
@@ -251,9 +262,11 @@ fn get_prompt_tags_impl(conn: &Connection, prompt_id: &str) -> Result<Vec<Tag>, 
 
 /// 标签数量上限，与自动分类提示词里的「最多5个标签」保持一致。
 const TAG_MAX_COUNT: usize = 5;
-/// 单个标签的字符数上限（提示词要求「每个不超过15字」）。
-/// 必须按**字符**计，按字节计会静默丢掉 6 个字以上的中文标签。
-const TAG_MAX_CHARS: usize = 15;
+/// 单个标签的存储字符上限。模型提示仍建议不超过 15 字，后端给真实工具名
+/// （如 Microsoft Copilot）和手工标签留足余量；必须按字符而非字节计算。
+const TAG_MAX_CHARS: usize = 64;
+const CATEGORY_MAX_CHARS: usize = 50;
+const SUMMARY_MAX_CHARS: usize = 200;
 
 #[tauri::command]
 pub fn set_prompt_tags(
@@ -276,60 +289,84 @@ fn replace_prompt_tags(
     prompt_id: &str,
     tag_names: &[String],
 ) -> Result<Vec<Tag>, String> {
+    let prompt_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM prompts WHERE id = ?1)",
+            rusqlite::params![prompt_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !prompt_exists {
+        return Err("Prompt 不存在".to_string());
+    }
+
+    // 空白、超长和重复项都不能占用数量上限；否则返回值会包含 INSERT OR
+    // IGNORE 实际未写入的重复标签，或提前丢弃后面的有效标签。
+    let mut normalized: Vec<String> = Vec::new();
+    for raw_name in tag_names {
+        let name = raw_name.trim();
+        if name.is_empty()
+            || name.chars().count() > TAG_MAX_CHARS
+            || normalized.iter().any(|existing| existing == name)
+        {
+            continue;
+        }
+        normalized.push(name.to_string());
+        if normalized.len() == TAG_MAX_COUNT {
+            break;
+        }
+    }
+
     conn.execute(
         "DELETE FROM prompt_tags WHERE prompt_id = ?1",
         rusqlite::params![prompt_id],
     )
     .map_err(|e| e.to_string())?;
 
-    let mut tags = Vec::new();
-    for name in tag_names {
-        if tags.len() >= TAG_MAX_COUNT {
-            break;
-        }
-
-        let name = name.trim();
-        if name.is_empty() || name.chars().count() > TAG_MAX_CHARS {
-            continue;
-        }
-
+    let mut tags = Vec::with_capacity(normalized.len());
+    for name in &normalized {
         let tag_id = upsert_tag(conn, name)?;
         conn.execute(
-            "INSERT OR IGNORE INTO prompt_tags (prompt_id, tag_id) VALUES (?1, ?2)",
+            "INSERT INTO prompt_tags (prompt_id, tag_id) VALUES (?1, ?2)",
             rusqlite::params![prompt_id, tag_id],
         )
         .map_err(|e| e.to_string())?;
-
         tags.push(Tag {
             id: tag_id,
-            name: name.to_string(),
+            name: name.clone(),
         });
     }
 
+    // 标签只能通过 Prompt 关联创建；不再被任何 Prompt 使用的标签没有用途，
+    // 一并清理可避免替换标签后不断累积孤儿行。
+    conn.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM prompt_tags pt WHERE pt.tag_id = tags.id
+         )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // normalized 已去重，以上 INSERT 任一失败都会回滚整个调用方事务，
+    // 因此这里按输入优先级返回的标签与实际写入的关联完全一致。
     Ok(tags)
 }
 
 fn upsert_tag(conn: &Connection, name: &str) -> Result<String, String> {
-    let existing = conn
-        .query_row(
-            "SELECT id FROM tags WHERE name = ?1",
-            rusqlite::params![name],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    let id = Uuid::new_v4().to_string();
+    let new_id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO tags (id, name) VALUES (?1, ?2)",
-        rusqlite::params![id, name],
+        "INSERT INTO tags (id, name) VALUES (?1, ?2)
+         ON CONFLICT(name) DO NOTHING",
+        rusqlite::params![new_id, name],
     )
     .map_err(|e| e.to_string())?;
-    Ok(id)
+
+    conn.query_row(
+        "SELECT id FROM tags WHERE name = ?1",
+        rusqlite::params![name],
+        |row| row.get::<_, String>(0),
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ------------------ Auto Classify ------------------
@@ -367,7 +404,30 @@ fn apply_classification_impl(
     recommended_tool: &str,
     tag_names: &[String],
 ) -> Result<Vec<Tag>, String> {
-    let now = conn_now(conn);
+    // IPC 和模型输出都不是可信边界。分类/摘要必须非空，长度按 Unicode
+    // 字符截断，不能用字符串字节下标切片（中文或 emoji 会 panic/截坏）。
+    let category = normalize_classification_text("分类", category, CATEGORY_MAX_CHARS)?;
+    let summary = normalize_classification_text("摘要", summary, SUMMARY_MAX_CHARS)?;
+
+    let tool = recommended_tool.trim();
+    if tool.chars().count() > TAG_MAX_CHARS {
+        return Err(format!("推荐工具名称不能超过 {TAG_MAX_CHARS} 个字符"));
+    }
+
+    // 推荐工具排在最前，超出数量上限时优先保留它。名称要么完整保留、要么
+    // 明确报错，绝不静默截成另一个看似有效但错误的工具名。
+    let mut names: Vec<String> = Vec::with_capacity(tag_names.len() + 1);
+    if !tool.is_empty() {
+        names.push(tool.to_string());
+    }
+    for name in tag_names {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && !names.iter().any(|n| n == trimmed) {
+            names.push(trimmed.to_string());
+        }
+    }
+
+    let now = conn_now(conn)?;
     let affected = conn
         .execute(
             "UPDATE prompts SET category = ?1, summary = ?2, updated_at = ?3 WHERE id = ?4",
@@ -379,26 +439,19 @@ fn apply_classification_impl(
         return Err("Prompt 不存在".to_string());
     }
 
-    // 推荐工具排在最前，超出上限时优先保留它。`replace_prompt_tags` 会直接
-    // 丢弃超过 TAG_MAX_CHARS 的名字，所以这里先按字符截断 —— 否则
-    // "Microsoft Copilot" 这类 17 字符的工具名会无声消失。
-    let mut names: Vec<String> = Vec::with_capacity(tag_names.len() + 1);
-    let tool: String = recommended_tool
-        .trim()
-        .chars()
-        .take(TAG_MAX_CHARS)
-        .collect();
-    if !tool.is_empty() {
-        names.push(tool);
-    }
-    for name in tag_names {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() && !names.iter().any(|n| n == trimmed) {
-            names.push(trimmed.to_string());
-        }
-    }
-
     replace_prompt_tags(conn, id, &names)
+}
+
+fn normalize_classification_text(
+    label: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label}不能为空"));
+    }
+    Ok(trimmed.chars().take(max_chars).collect())
 }
 
 // ------------------ Search ------------------
@@ -427,9 +480,25 @@ fn row_to_prompt(row: &rusqlite::Row) -> rusqlite::Result<Prompt> {
     })
 }
 
-fn conn_now(conn: &Connection) -> String {
-    conn.query_row("SELECT datetime('now', 'localtime')", [], |row| row.get(0))
-        .unwrap_or_else(|_| String::from("unknown"))
+fn row_to_prompt_summary(row: &rusqlite::Row) -> rusqlite::Result<PromptSummary> {
+    Ok(PromptSummary {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        content_preview: row.get(2)?,
+        category: row.get(3)?,
+        summary: row.get(4)?,
+        is_favorite: row.get::<_, i32>(5)? != 0,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        last_used_at: row.get(8)?,
+    })
+}
+
+fn conn_now(conn: &Connection) -> Result<String, String> {
+    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| format!("读取数据库时间失败: {}", e))
 }
 
 #[cfg(test)]
@@ -465,6 +534,26 @@ mod tests {
         assert!(contains_cjk("帮我写一个关于"));
         assert!(contains_cjk("日本語"));
         assert!(contains_cjk("한국어"));
+    }
+
+    #[test]
+    fn contains_cjk_detects_modern_ideograph_extensions_and_hangul_jamo() {
+        for codepoint in [
+            0x20000, // Extension B，超出 BMP，需两个 UTF-16 code unit
+            0x2A700, // Extension C
+            0x2EBF0, // Extension I
+            0x30000, // Extension G
+            0x31350, // Extension H
+        ] {
+            let character = char::from_u32(codepoint).expect("valid CJK codepoint");
+            assert!(
+                contains_cjk(&character.to_string()),
+                "U+{codepoint:05X} 应走 LIKE 路由"
+            );
+        }
+        for query in ["ᄀ", "ㄱ", "ꥠ", "ힰ"] {
+            assert!(contains_cjk(query), "{query:?} 应识别为 Hangul Jamo");
+        }
     }
 
     #[test]
@@ -626,6 +715,60 @@ mod tests {
     }
 
     #[test]
+    fn ascii_search_does_not_let_partial_fts_hits_hide_tag_only_matches() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "Python guide", "write a python script");
+        insert_prompt(&conn, "p2", "Tagged only", "unrelated body");
+        apply_classification_impl(&conn, "p2", "分类", "摘要", "", &["python".to_string()])
+            .expect("attach python tag");
+
+        let results = search_prompts_impl(&conn, "python").expect("search");
+
+        assert_eq!(results.len(), 2, "正文命中和标签命中必须同时返回");
+        assert!(results.iter().any(|r| r.id == "p1"));
+        assert!(results.iter().any(|r| r.id == "p2"));
+    }
+
+    #[test]
+    fn mixed_query_applies_and_semantics_across_content_and_tags() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "Automation", "write a python script");
+        insert_prompt(&conn, "p2", "No tag", "write a python script");
+        apply_classification_impl(&conn, "p1", "分类", "摘要", "", &["scheduled".to_string()])
+            .expect("attach scheduled tag");
+
+        let results = search_prompts_impl(&conn, "python scheduled").expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "p1");
+        assert_eq!(results[0].tags, vec!["scheduled".to_string()]);
+    }
+
+    #[test]
+    fn cjk_tag_only_query_is_recalled_and_tags_are_stably_sorted() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "无关标题", "无关正文");
+        apply_classification_impl(
+            &conn,
+            "p1",
+            "分类",
+            "摘要",
+            "",
+            &["短视频".to_string(), "自动化".to_string()],
+        )
+        .expect("attach tags");
+
+        let results = search_prompts_impl(&conn, "短视频").expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "p1");
+        assert_eq!(
+            results[0].tags,
+            vec!["短视频".to_string(), "自动化".to_string()]
+        );
+    }
+
+    #[test]
     fn blank_query_returns_recent_prompts() {
         let conn = test_conn();
         insert_prompt(&conn, "p1", "第一条", "内容一");
@@ -634,6 +777,43 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "p1");
+    }
+
+    #[test]
+    fn list_prompts_returns_only_summary_fields_and_a_bounded_preview() {
+        let conn = test_conn();
+        let content = "界".repeat(250);
+        insert_prompt(&conn, "p1", "长正文", &content);
+        conn.execute(
+            "UPDATE prompts SET optimized_content = '不应出现在列表中', category = '分类', summary = '摘要' WHERE id = 'p1'",
+            [],
+        )
+        .expect("set metadata");
+
+        let prompts = list_prompts_impl(&conn, None, None).expect("list prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].content_preview, "界".repeat(200));
+
+        let value = serde_json::to_value(&prompts[0]).expect("serialize summary");
+        let object = value.as_object().expect("summary object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "category",
+                "content_preview",
+                "created_at",
+                "id",
+                "is_favorite",
+                "last_used_at",
+                "summary",
+                "title",
+                "updated_at",
+            ]
+        );
+        assert!(!object.contains_key("content"));
+        assert!(!object.contains_key("optimized_content"));
     }
 
     // ------------------ Error surfacing ------------------
@@ -658,18 +838,65 @@ mod tests {
     // ------------------ Tags ------------------
 
     #[test]
-    fn apply_classification_truncates_an_overlong_recommended_tool_instead_of_dropping_it() {
+    fn apply_classification_preserves_the_full_recommended_tool_name() {
         let conn = test_conn();
         insert_prompt(&conn, "p1", "标题", "内容");
 
-        // 17 个字符，超过 TAG_MAX_CHARS(15)。旧实现会直接丢弃这个标签，
-        // 与「推荐工具优先保留」的注释相矛盾。
         let tags = apply_classification_impl(&conn, "p1", "分类", "摘要", "Microsoft Copilot", &[])
             .expect("classify");
 
         assert_eq!(tags.len(), 1, "推荐工具不应被丢弃");
-        assert_eq!(tags[0].name.chars().count(), TAG_MAX_CHARS);
-        assert!(tags[0].name.starts_with("Microsoft"));
+        assert_eq!(tags[0].name, "Microsoft Copilot");
+    }
+
+    #[test]
+    fn apply_classification_rejects_an_overlong_tool_instead_of_truncating_it() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+        let overlong = "工".repeat(TAG_MAX_CHARS + 1);
+
+        let error = apply_classification_impl(&conn, "p1", "分类", "摘要", &overlong, &[])
+            .expect_err("过长的工具名必须明确报错");
+        assert!(error.contains("推荐工具名称"));
+        let tags = get_prompt_tags_impl(&conn, "p1").expect("read tags");
+        assert!(tags.is_empty(), "失败时不能写入截断的标签");
+    }
+
+    #[test]
+    fn apply_classification_requires_nonblank_category_and_summary() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+
+        for (category, summary, expected) in [
+            ("  ", "有效摘要", "分类不能为空"),
+            ("有效分类", "\n ", "摘要不能为空"),
+        ] {
+            let error = apply_classification_impl(&conn, "p1", category, summary, "", &[])
+                .expect_err("空白元数据必须被拒绝");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn apply_classification_truncates_metadata_by_unicode_characters() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+        let category = format!("  {}  ", "界".repeat(CATEGORY_MAX_CHARS + 20));
+        let summary = "🙂".repeat(SUMMARY_MAX_CHARS + 20);
+
+        apply_classification_impl(&conn, "p1", &category, &summary, "", &[])
+            .expect("classify unicode metadata");
+
+        let (stored_category, stored_summary): (String, String) = conn
+            .query_row(
+                "SELECT category, summary FROM prompts WHERE id = 'p1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read metadata");
+        assert_eq!(stored_category, "界".repeat(CATEGORY_MAX_CHARS));
+        assert_eq!(stored_summary, "🙂".repeat(SUMMARY_MAX_CHARS));
+        assert_eq!(stored_summary.chars().count(), SUMMARY_MAX_CHARS);
     }
 
     #[test]
@@ -691,6 +918,7 @@ mod tests {
         .expect("apply classification");
 
         let returned_names: Vec<&str> = returned.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(returned_names.first(), Some(&"Claude"));
         assert!(
             returned_names.contains(&"Claude"),
             "返回的标签里应含推荐工具: {returned_names:?}"
@@ -750,14 +978,14 @@ mod tests {
 
     #[test]
     fn tag_length_limit_counts_characters_not_bytes() {
-        // 回归测试：用 `name.len()` 判长度是字节数，6 个汉字（18 字节）的标签会被
-        // 静默丢弃，而被丢弃的正是模型最常生成的那类中文标签。
+        // 回归测试：达到字符上限的中文标签在 UTF-8 下远超字节上限，
+        // 用 `name.len()` 判长会把合法标签静默丢弃。
         let conn = test_conn();
         insert_prompt(&conn, "p1", "标题", "内容");
 
-        let six_chars = "自动化工作流"; // 6 字 / 18 字节
-        assert_eq!(six_chars.chars().count(), 6);
-        assert!(six_chars.len() > TAG_MAX_CHARS);
+        let unicode_tag = "界".repeat(TAG_MAX_CHARS);
+        assert_eq!(unicode_tag.chars().count(), TAG_MAX_CHARS);
+        assert!(unicode_tag.len() > TAG_MAX_CHARS);
 
         let tags = apply_classification_impl(
             &conn,
@@ -765,12 +993,12 @@ mod tests {
             "内容创作",
             "摘要",
             "",
-            &[six_chars.to_string()],
+            std::slice::from_ref(&unicode_tag),
         )
         .expect("classify");
 
-        assert_eq!(tags.len(), 1, "6 个汉字的标签应当被接受");
-        assert_eq!(tags[0].name, six_chars);
+        assert_eq!(tags.len(), 1, "达到字符上限的中文标签应被接受");
+        assert_eq!(tags[0].name, unicode_tag);
     }
 
     #[test]
@@ -797,6 +1025,86 @@ mod tests {
         assert!(tags.iter().all(|t| !t.name.trim().is_empty()));
     }
 
+    #[test]
+    fn replace_prompt_tags_normalizes_before_limit_and_matches_stored_rows() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题", "内容");
+        let overlong = "长".repeat(TAG_MAX_CHARS + 1);
+        let input = vec![
+            "  ".to_string(),
+            " alpha ".to_string(),
+            "alpha".to_string(),
+            overlong,
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+            "epsilon".to_string(),
+            "zeta".to_string(),
+        ];
+
+        let returned = replace_prompt_tags(&conn, "p1", &input).expect("replace tags");
+        let stored = get_prompt_tags_impl(&conn, "p1").expect("read stored tags");
+        let mut returned_pairs: Vec<(&str, &str)> = returned
+            .iter()
+            .map(|tag| (tag.id.as_str(), tag.name.as_str()))
+            .collect();
+        let mut stored_pairs: Vec<(&str, &str)> = stored
+            .iter()
+            .map(|tag| (tag.id.as_str(), tag.name.as_str()))
+            .collect();
+        returned_pairs.sort_unstable();
+        stored_pairs.sort_unstable();
+
+        assert_eq!(returned_pairs, stored_pairs);
+        assert_eq!(returned.len(), TAG_MAX_COUNT);
+        assert!(!returned.iter().any(|tag| tag.name == "zeta"));
+        assert!(returned.iter().any(|tag| tag.name == "epsilon"));
+    }
+
+    #[test]
+    fn replace_prompt_tags_reuses_one_tag_per_name_and_cleans_orphans() {
+        let conn = test_conn();
+        insert_prompt(&conn, "p1", "标题一", "内容");
+        insert_prompt(&conn, "p2", "标题二", "内容");
+
+        let first = replace_prompt_tags(&conn, "p1", &["shared".to_string(), "old".to_string()])
+            .expect("set first tags");
+        let second =
+            replace_prompt_tags(&conn, "p2", &["shared".to_string()]).expect("set second tags");
+        assert_eq!(
+            first.iter().find(|tag| tag.name == "shared").unwrap().id,
+            second[0].id
+        );
+
+        replace_prompt_tags(&conn, "p1", &["shared".to_string()]).expect("replace first tags");
+        let names: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE name = 'shared'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count shared tags");
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags t WHERE NOT EXISTS (
+                     SELECT 1 FROM prompt_tags pt WHERE pt.tag_id = t.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count orphan tags");
+        assert_eq!(names, 1);
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn replace_prompt_tags_rejects_a_missing_prompt_even_with_no_tags() {
+        let conn = test_conn();
+
+        let error = replace_prompt_tags(&conn, "missing", &[]).expect_err("missing prompt");
+        assert_eq!(error, "Prompt 不存在");
+    }
+
     // ------------------ Delete ------------------
 
     #[test]
@@ -817,6 +1125,24 @@ mod tests {
             )
             .expect("count links");
         assert_eq!(links, 0, "标签关联应被一并清理");
+        let orphan_tags: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags t WHERE NOT EXISTS (
+                     SELECT 1 FROM prompt_tags pt WHERE pt.tag_id = t.id
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count orphan tags");
+        assert_eq!(orphan_tags, 0, "删除最后一条引用后不应留下孤儿标签");
+    }
+
+    #[test]
+    fn delete_rejects_a_missing_prompt() {
+        let conn = test_conn();
+
+        let error = delete_prompt_impl(&conn, "missing").expect_err("missing prompt");
+        assert_eq!(error, "Prompt 不存在");
     }
 
     #[test]

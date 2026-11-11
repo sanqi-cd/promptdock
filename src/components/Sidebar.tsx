@@ -1,31 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { usePromptStore } from "@/stores/promptStore";
 import { useThemeStore } from "@/stores/themeStore";
+import { useCategoryStore } from "@/stores/categoryStore";
 import { CATEGORIES } from "@/components/CategoryTags";
 import { CategoryIcon } from "@/lib/categoryIcons";
 import { cn } from "@/lib/utils";
 import type { MainView, ListMode } from "@/App";
 import promptdockLogo from "@/assets/brand/promptdock-app-icon-256.png";
-
-const STORAGE_KEY = "promptdock_custom_categories";
-
-function loadCustomCategories(): string[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.every((item): item is string => typeof item === "string")) {
-      return parsed;
-    }
-    return [];
-  } catch {
-    return [];
-  }
-}
-
-function saveCustomCategories(cats: string[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(cats));
-}
 
 interface SidebarProps {
   mainView: MainView;
@@ -123,17 +104,15 @@ function navItemTarget(id: string): { target: MainView; mode?: ListMode } {
 }
 
 export function Sidebar({ mainView, listMode, onNavigate, onNewPrompt }: SidebarProps) {
-  const prompts = usePromptStore((s) => s.prompts);
+  const prompts = usePromptStore((s) => s.allPrompts);
   const selectedCategory = usePromptStore((s) => s.selectedCategory);
   const theme = useThemeStore((s) => s.theme);
   const toggleTheme = useThemeStore((s) => s.toggleTheme);
-  const [customCategories, setCustomCategories] = useState<string[]>(loadCustomCategories);
+  const customCategories = useCategoryStore((s) => s.customCategories);
+  const addCustomCategory = useCategoryStore((s) => s.addCustomCategory);
+  const removeCustomCategory = useCategoryStore((s) => s.removeCustomCategory);
   const [showAddInput, setShowAddInput] = useState(false);
   const [newCatName, setNewCatName] = useState("");
-
-  useEffect(() => {
-    saveCustomCategories(customCategories);
-  }, [customCategories]);
 
   const allCategories = [...CATEGORIES, ...customCategories.filter((c) => !(CATEGORIES as readonly string[]).includes(c))];
 
@@ -169,13 +148,13 @@ export function Sidebar({ mainView, listMode, onNavigate, onNewPrompt }: Sidebar
       setShowAddInput(false);
       return;
     }
-    setCustomCategories((prev) => [...prev, name]);
+    addCustomCategory(name);
     setNewCatName("");
     setShowAddInput(false);
   };
 
   const handleRemoveCategory = (cat: string) => {
-    setCustomCategories((prev) => prev.filter((c) => c !== cat));
+    removeCustomCategory(cat);
     if (selectedCategory === cat) {
       const store = usePromptStore.getState();
       store.setSelectedCategory(null);

@@ -9,6 +9,7 @@ import { useToast } from "@/components/ui/toast";
 import { cn, getErrorMessage } from "@/lib/utils";
 import { DeleteConfirmModal } from "@/components/DeleteConfirmModal";
 import { formatDate } from "@/lib/formatDate";
+import { hasTauriInvoke } from "@/lib/tauriRuntime";
 
 const PROVIDERS: { value: string; label: string }[] = [
   { value: "openai", label: "OpenAI" },
@@ -62,6 +63,8 @@ export function SettingsPage() {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [isSaving, setIsSaving] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [backupPath, setBackupPath] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
@@ -183,6 +186,35 @@ export function SettingsPage() {
     }
   };
 
+  const handleBackup = async () => {
+    if (isBackingUp) return;
+    if (!hasTauriInvoke()) {
+      addToast("桌面运行时不可用，无法备份数据", "error");
+      return;
+    }
+
+    setIsBackingUp(true);
+    try {
+      const path = await invoke<string>("backup_database");
+      setBackupPath(path);
+      addToast("数据备份完成", "success");
+    } catch (e) {
+      addToast(`备份失败：${getErrorMessage(e)}`, "error");
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
+  const handleCopyBackupPath = async () => {
+    if (!backupPath) return;
+    try {
+      await navigator.clipboard.writeText(backupPath);
+      addToast("备份路径已复制", "success");
+    } catch {
+      addToast("复制失败，请手动选择路径复制", "error");
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="pt-6 px-5">
@@ -199,6 +231,45 @@ export function SettingsPage() {
             添加配置
           </Button>
         </div>
+
+        <Card className="mb-4 bg-white/[0.02] border-white/[0.06]">
+          <CardHeader className="px-4 py-3 pb-2">
+            <CardTitle className="text-[13px] text-slate-100">数据备份</CardTitle>
+            <CardDescription className="text-[12px] text-slate-500">
+              备份包含全部 Prompt 与敏感模型配置，请妥善保管。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-4 pb-4 space-y-2.5">
+            <Button
+              onClick={handleBackup}
+              disabled={isBackingUp}
+              size="sm"
+              variant="outline"
+              className="h-8 text-[12px]"
+            >
+              {isBackingUp ? "备份中..." : "备份数据"}
+            </Button>
+            {backupPath && (
+              <div className="flex items-center gap-2">
+                <Input
+                  readOnly
+                  value={backupPath}
+                  aria-label="备份文件路径"
+                  onFocus={(event) => event.currentTarget.select()}
+                  className="h-8 flex-1 text-[12px] text-slate-300"
+                />
+                <Button
+                  onClick={handleCopyBackupPath}
+                  size="sm"
+                  variant="ghost"
+                  className="h-8 shrink-0 text-[12px]"
+                >
+                  复制路径
+                </Button>
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
         {/* 读取失败不能伪装成「暂无配置」 */}
         {configError && (

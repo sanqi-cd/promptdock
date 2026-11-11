@@ -3,7 +3,7 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   timeout: 30000,
-  retries: 1,
+  retries: process.env.CI ? 1 : 0,
   webServer: {
     command: "pnpm exec vite --host 127.0.0.1",
     url: "http://localhost:1420",

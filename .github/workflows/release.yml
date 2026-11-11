@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-universal:
+    name: macOS universal DMG
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      # 均可选：完整配置签名 secrets 才使用 Developer ID；完整配置公证
+      # secrets 才启用 Apple notarization。缺失时明确发布未签名、未公证产物。
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 校验 tag 与可选签名/公证配置
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} 必须与 package.json 版本 v${version} 一致。"
+            exit 1
+          fi
+
+          signing=0
+          notarizing=0
+          if [[ -n "${APPLE_CERTIFICATE}" || -n "${APPLE_CERTIFICATE_PASSWORD}" || -n "${APPLE_SIGNING_IDENTITY}" ]]; then
+            if [[ -z "${APPLE_CERTIFICATE}" || -z "${APPLE_CERTIFICATE_PASSWORD}" || -z "${APPLE_SIGNING_IDENTITY}" ]]; then
+              echo "签名配置不完整：需要 APPLE_CERTIFICATE、APPLE_CERTIFICATE_PASSWORD、APPLE_SIGNING_IDENTITY。"
+              exit 1
+            fi
+            signing=1
+          fi
+
+          if [[ -n "${APPLE_ID}" || -n "${APPLE_PASSWORD}" || -n "${APPLE_TEAM_ID}" ]]; then
+            if [[ -z "${APPLE_ID}" || -z "${APPLE_PASSWORD}" || -z "${APPLE_TEAM_ID}" ]]; then
+              echo "公证配置不完整：需要 APPLE_ID、APPLE_PASSWORD、APPLE_TEAM_ID。"
+              exit 1
+            fi
+            if [[ "${signing}" != 1 ]]; then
+              echo "公证前必须完整配置 Developer ID 签名 secrets。"
+              exit 1
+            fi
+            notarizing=1
+          fi
+
+          {
+            echo "signing=${signing}"
+            echo "notarizing=${notarizing}"
+          } >> "${GITHUB_ENV}"
+
+      - name: 构建 universal DMG
+        run: pnpm tauri:build:dmg
+
+      - name: 验证 DMG 内应用的实际签名与 stapling 状态
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if (( ${#dmgs[@]} == 0 )); then
+            echo "未找到待验证的 universal DMG。"
+            exit 1
+          fi
+          # CI 构建会在 DMG 完成后清理中间 .app，必须验证最终 DMG 内的应用，
+          # 而不是已经不存在、且可能与安装包内容不同的 bundle/macos 路径。
+          mount_dir="$(mktemp -d /tmp/promptdock-release-verify.XXXXXX)"
+          cleanup() {
+            hdiutil detach "${mount_dir}" >/dev/null 2>&1 || true
+            rmdir "${mount_dir}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "${mount_dir}" "${dmgs[0]}"
+          app="${mount_dir}/PromptDock.app"
+          if [[ "${signing}" == 1 ]]; then
+            codesign --verify --deep --strict --verbose=2 "${app}"
+          fi
+          if [[ "${notarizing}" == 1 ]]; then
+            xcrun stapler validate "${app}"
+          fi
+
+      - name: 收集 DMG 并生成 SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          shopt -s nullglob
+          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if (( ${#dmgs[@]} == 0 )); then
+            echo "未找到 universal DMG。"
+            exit 1
+          fi
+          cp "${dmgs[@]}" release-artifacts/
+          (cd release-artifacts && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+          {
+            echo "PromptDock ${GITHUB_REF_NAME}（macOS universal，Apple Silicon + Intel）"
+            echo
+            if [[ "${signing}" == 1 ]]; then
+              echo "- Developer ID 签名已通过 codesign 验证。"
+            else
+              echo "- 未配置 Developer ID secrets；产物未进行代码签名。"
+            fi
+            if [[ "${notarizing}" == 1 ]]; then
+              echo "- Apple 公证票据已通过 stapler validate 验证。"
+            else
+              echo "- 未配置 Apple 公证 secrets；产物未经 notarization。"
+            fi
+          } > release-artifacts/RELEASE_NOTES.md
+
+      - name: 发布 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(release-artifacts/*.dmg)
+          gh release create "${GITHUB_REF_NAME}" \
+            "${dmgs[@]}" \
+            release-artifacts/SHA256SUMS.txt \
+            --title "PromptDock ${GITHUB_REF_NAME}" \
+            --notes-file release-artifacts/RELEASE_NOTES.md

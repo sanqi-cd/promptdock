@@ -11,6 +11,18 @@ export interface Prompt {
   last_used_at: string | null;
 }
 
+export interface PromptSummary {
+  id: string;
+  title: string;
+  content_preview: string;
+  category: string | null;
+  summary: string | null;
+  is_favorite: boolean;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string | null;
+}
+
 export interface Tag {
   id: string;
   name: string;

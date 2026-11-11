@@ -18,9 +18,25 @@ release/PromptDock_0.1.1_universal_adhoc.dmg
 
 ![拖入 Applications](images/install-drag-applications.png)
 
+### 校验安装包 SHA256
+
+下载 DMG 和配套的 `SHA256SUMS.txt` 后，在两者所在目录运行：
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+如果使用的是项目内置安装包，则从仓库根目录运行：
+
+```bash
+(cd release && shasum -a 256 -c SHA256SUMS.txt)
+```
+
+看到 DMG 文件名后显示 `OK` 才继续安装；如果校验失败，请重新下载，不要打开安装包。
+
 ## 2. 处理 macOS 安全提示
 
-当前版本使用 ad-hoc 签名，尚未使用 Apple Developer ID 签名和 notarization。因此第一次打开时，macOS 可能会提示无法验证开发者。
+默认未配置 Apple 凭据的构建未进行代码签名，也未使用 Apple Developer ID 签名和 notarization。因此第一次打开时，macOS 可能会提示无法验证开发者。
 
 如果出现安全提示，先选择完成或关闭提示。
 
@@ -150,3 +166,69 @@ Prompt 保存后，可以点击右侧的自动分类，让 AI 根据内容为 Pr
 - 对过长 Prompt 使用精简。
 - 对复杂任务、工作流或需要稳定输出质量的 Prompt 使用专家增强。
 - API Key 建议使用单独创建的低额度 Key，便于控制风险。
+
+## 10. 本地数据与 API Key 安全
+
+Prompt、分类、设置和模型 API Key 都保存在以下本地 SQLite 数据库中：
+
+```text
+~/Library/Application Support/com.promptdock.desktop/promptdock.db
+```
+
+当前版本的 API Key 在数据库中是**明文**，没有存入 macOS Keychain。SQLite WAL 模式下的 `promptdock.db-wal` 和 `promptdock.db-shm` 也可能包含明文 Key；删除模型配置不等于立即擦除数据库或 WAL 中的历史副本。数据库目录和文件权限分别为 `0700`、`0600`，但这不能替代加密，能够读取你账户文件的进程仍可能读取这些内容。
+
+API Key 只会发送到你配置的模型 Base URL。公网地址必须使用 HTTPS；HTTP 仅允许 `localhost`、`127.0.0.1` 和 `::1`，用于本机模型服务。应用不会跟随模型接口的 HTTP 重定向。建议使用单独、低额度、可随时撤销的 API Key，并同样保护备份文件。
+
+## 11. 备份与恢复
+
+### 备份
+
+在设置页点击「备份数据」，应用会通过 SQLite `VACUUM INTO` 创建一致性 `.db` 备份，包含 WAL 中已提交的内容，备份时无需退出应用。成功后，设置页会显示并可复制实际备份路径。备份目录为：
+
+```text
+~/Library/Application Support/com.promptdock.desktop/backups/
+```
+
+备份目录权限为 `0700`，应用创建的备份文件权限为 `0600`。**备份同样包含明文 API Key**，必须按 `0600` 权限妥善保管，不要上传到不受信任的共享目录或明文云盘；复制到其他位置后应重新检查权限：
+
+```bash
+chmod 600 "/请替换为实际备份文件.db"
+sqlite3 "/请替换为实际备份文件.db" "PRAGMA integrity_check;"
+```
+
+第二条命令应输出 `ok`。如需异地保存，优先使用加密磁盘或加密归档。
+
+### 恢复
+
+当前设置页只提供备份，不提供自动恢复。恢复前先在设置页点击「备份数据」，为**现有**数据库保留一份一致性备份，然后完全退出 PromptDock。不要在应用运行时替换数据库。
+
+旧 `promptdock.db-wal` / `promptdock.db-shm` 可能包含尚未 checkpoint 的已提交数据，不要盲目删除；确需移走旧 WAL/SHM 时，必须先另有备份。以下手动流程会把现有主数据库和 WAL/SHM **移动**到独立回滚目录，而不是删除，再复制指定备份为新的 `promptdock.db`：
+
+```bash
+DATA_DIR="$HOME/Library/Application Support/com.promptdock.desktop"
+BACKUP_FILE="/请替换为要恢复的 backups/备份文件.db"
+ROLLBACK_DIR="$HOME/Documents/PromptDock-before-restore-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$ROLLBACK_DIR"
+chmod 700 "$ROLLBACK_DIR"
+for file in promptdock.db promptdock.db-wal promptdock.db-shm; do
+  if [ -f "$DATA_DIR/$file" ]; then
+    mv "$DATA_DIR/$file" "$ROLLBACK_DIR/"
+  fi
+done
+cp -p "$BACKUP_FILE" "$DATA_DIR/promptdock.db"
+chmod 600 "$DATA_DIR/promptdock.db"
+```
+
+执行前应确认 `BACKUP_FILE` 指向已通过完整性检查的目标备份。移走旧 WAL/SHM 是为了防止旧 WAL 被应用到替换后的主数据库，并不代表这些文件没有数据价值。确认恢复成功前不要删除 `PromptDock-before-restore-*` 回滚目录。恢复后重新打开 PromptDock，检查 Prompt 和模型配置是否正常。
+
+## 12. 卸载与残留清理
+
+将 `/Applications/PromptDock.app` 移到废纸篓只会删除应用，**不会删除本地数据库**。如果希望保留数据，卸载后不要删除上述数据库目录；重新安装后仍可继续使用。
+
+如果已完全退出应用、完成备份，并确定要永久删除所有 Prompt、分类、设置、明文 API Key 及 WAL/SHM 残留，可执行：
+
+```bash
+rm -rf "$HOME/Library/Application Support/com.promptdock.desktop"
+```
+
+此命令不可撤销，执行前务必核对路径。若这些 API Key 仍在使用，还应到对应服务商后台撤销；删除本地文件不会使已经泄露或备份到其他位置的 Key 失效。

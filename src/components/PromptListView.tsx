@@ -40,7 +40,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
     ? searchResults.map((r) => ({
         id: r.id,
         title: r.title,
-        content: r.summary || "",
+        content_preview: r.summary || "",
         category: r.category,
         is_favorite: r.is_favorite,
         updated_at: r.updated_at,
@@ -209,7 +209,7 @@ export function PromptListView({ mode, onSelectPrompt, onOpenDetail }: PromptLis
                         )}
                       </div>
                       <p className="text-[12px] text-slate-500 line-clamp-2 mt-1">
-                        {item.content.slice(0, 150)}
+                        {item.content_preview.slice(0, 150)}
                       </p>
                     </div>
                     <span className="text-[11px] text-slate-600 shrink-0 mt-0.5">

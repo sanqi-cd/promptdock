@@ -42,6 +42,7 @@ src-tauri/               Rust 后端
   src/
     lib.rs               Tauri 入口、Command 注册
     db.rs                数据库初始化、FTS5
+  backup.rs            VACUUM INTO 一致性备份，保存到应用数据目录 backups/
     models.rs            数据结构
     commands.rs          Prompt CRUD、标签、自动分类 Commands
     search.rs            FTS5 + LIKE 双路径搜索（分词规则见文件头注释）
@@ -76,9 +77,10 @@ src-tauri/               Rust 后端
 弹窗打开时（`data-modal-open="true"`，见 `src/lib/overlay.ts`）全局快捷键一律禁用：
 否则搜索框里的 ⌘↵ 会发起一次真实计费的润色调用。
 
-时间戳一律走 `src/lib/formatDate.ts`，不要直接 `new Date(后端字段)`：后端存的是
-`"2026-06-21 19:36:00"`（非 ISO、无时区），解析行为属于实现定义；而且 `conn_now()`
-在查询失败时会写入字面量 `"unknown"`，直接 `new Date()` 会渲染出 "Invalid Date"。
+时间戳一律走 `src/lib/formatDate.ts`，不要直接 `new Date(后端字段)`：新记录写入
+`"2026-06-21T19:36:00Z"` 这样的 UTC ISO 时间；旧记录仍可能是 `datetime('now', 'localtime')`
+写入的 `"2026-06-21 19:36:00"`（非 ISO、无时区）。`parseTimestamp` 对旧格式显式按本地时间
+解析，对新格式走 ISO 解析；无法识别时返回空串，而不是渲染 "Invalid Date"。
 
 标签长度按**字符**计（`TAG_MAX_CHARS`），不是字节 —— 按字节会把 6 个字以上的中文
 标签静默丢弃。自动分类结果必须走 `apply_classification` 单命令写入：曾被拆成
@@ -92,14 +94,16 @@ src-tauri/               Rust 后端
 - 落库位置：`~/Library/Application Support/com.promptdock.desktop/promptdock.db`
 - 列为 `api_configs.api_key`；WAL 模式下明文同样会残留在 `.db-wal` / `.db-shm`，删除配置不等于擦除
 - 数据库目录 0700、db/wal/shm 文件 0600（`db.rs::restrict_db_permissions`）
+- `backup_database` 通过 `VACUUM INTO` 在数据目录 `backups/` 创建一致性 `.db`；目录 0700、文件 0600，备份仍含明文 API Key
 - Key 只会发送到用户自己配置的 `base_url`；`validate_base_url` 用 URL 解析而非前缀匹配，
   拒绝 userinfo（`https://api.openai.com@evil.example`）、query、fragment
+- 公网地址必须使用 HTTPS；HTTP 仅允许 `localhost`、`127.0.0.1`、`::1`，读取历史配置用于请求时也会重新校验
 - 修改已有配置时，若 `base_url` 的 scheme/host/port 变化且 Key 留空，更新会被拒绝，
   必须重新输入 Key（`same_origin`）；避免旧 Key 被静默转发到新主机
 - HTTP 客户端禁用重定向（`redirect::Policy::none()`）：reqwest 跨主机重定向只剥离
   `Authorization`，不会剥离 Anthropic 的自定义 `x-api-key`
 - 流式请求使用不带总超时的独立客户端；总超时会把超过 300 秒的长流从中间掐断
-- 之所以暂不上 Keychain：当前是 ad-hoc 签名，每次重新编译签名标识都会变，Keychain ACL 随之失效，开发期每次构建都要重新授权；且 ad-hoc 签名对本地已提权攻击者防护有限。计划在拿到 Apple Developer ID 签名后再引入 `keyring`
+- 之所以暂不上 Keychain：当前本地构建未使用稳定的 Developer ID 签名，开发期签名身份不稳定，Keychain ACL 容易失效；未签名或 ad-hoc 签名对本地已提权攻击者的防护也有限。计划在拿到 Apple Developer ID 签名后再引入 `keyring`
 
 改动这块时请同步更新 `README.md` 的安全说明。
 
@@ -112,14 +116,14 @@ pnpm tauri dev
 # 仅前端
 pnpm dev
 
-# 类型检查
-pnpm tsc --noEmit
+# 类型检查（src + Vite/Playwright 配置 + E2E）
+pnpm typecheck
 
-# Rust 构建
-cargo build
+# Rust 构建（从仓库根目录执行）
+cargo build --manifest-path src-tauri/Cargo.toml --locked
 
-# Rust 测试
-cargo test
+# Rust 测试（从仓库根目录执行）
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 
 # Rust 格式检查（CI 会跑）
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
@@ -128,8 +132,10 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 pnpm audit --audit-level high
 cargo audit --file src-tauri/Cargo.lock
 
-# 生产构建
-pnpm tauri build
+# 生产构建（macOS universal DMG）
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+pnpm tauri:build:dmg
+# 等价于：pnpm tauri build --target universal-apple-darwin --bundles dmg -- --locked
 ```
 
 ## 数据流
@@ -162,6 +168,7 @@ React UI → Zustand Store → invoke() → Tauri Command → rusqlite → SQLit
 | test_connection | 测试 API 连接 |
 | list_api_configs / get_active_config | API 配置查询 |
 | save_api_config / update_api_config / delete_api_config / activate_api_config | API 配置管理 |
+| backup_database | 通过 VACUUM INTO 创建一致性 .db 备份到应用数据目录 backups/，返回备份路径 |
 
 ## 搜索实现的两条约束
 

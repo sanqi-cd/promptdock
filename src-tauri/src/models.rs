@@ -15,6 +15,19 @@ pub struct Prompt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptSummary {
+    pub id: String,
+    pub title: String,
+    pub content_preview: String,
+    pub category: Option<String>,
+    pub summary: Option<String>,
+    pub is_favorite: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub id: String,
     pub name: String,

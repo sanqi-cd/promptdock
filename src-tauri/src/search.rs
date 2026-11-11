@@ -28,6 +28,10 @@ pub(crate) fn search_prompts_impl(
         // impossible AND. LIKE is the only correct matcher for CJK here, and it
         // is fast enough for a local prompt library.
         like_search(conn, query)?
+    } else if query_matches_tag(conn, query)? {
+        // FTS 不索引 tags。只要任一词能命中标签，就必须走同时覆盖正文和
+        // 标签的 LIKE；否则 FTS 命中部分正文后会跳过空结果兜底，漏掉标签结果。
+        like_search(conn, query)?
     } else {
         let fts_results = fts_search(conn, query)?;
         if fts_results.is_empty() {
@@ -71,16 +75,41 @@ fn fts_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, Strin
     ))
 }
 
+/// Whether any search term occurs in a tag name. This check is what prevents
+/// a partially successful FTS query from hiding rows that match only by tag.
+fn query_matches_tag(conn: &Connection, query: &str) -> Result<bool, String> {
+    let terms = like_patterns(query);
+    if terms.is_empty() {
+        return Ok(false);
+    }
+
+    let clauses: Vec<String> = (1..=terms.len())
+        .map(|index| format!("name LIKE ?{index} ESCAPE '\\'"))
+        .collect();
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE {})",
+        clauses.join(" OR ")
+    );
+    conn.query_row(&sql, rusqlite::params_from_iter(terms.iter()), |row| {
+        row.get(0)
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn like_patterns(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| format!("%{}%", escape_like(term)))
+        .collect()
+}
+
 /// Matches each whitespace-separated term as a literal substring; every term
-/// must appear somewhere in the row (AND), mirroring the FTS path.
+/// must appear somewhere in the row or its tags (AND), mirroring the FTS path.
 ///
 /// Callers pass raw user input, so LIKE metacharacters are escaped — otherwise a
 /// query of `%` would return every row.
 fn like_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, String> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|term| format!("%{}%", escape_like(term)))
-        .collect();
+    let terms = like_patterns(query);
 
     if terms.is_empty() {
         return Ok(Vec::new());
@@ -91,19 +120,24 @@ fn like_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, Stri
     for term in terms {
         let index = params.len() + 1;
         clauses.push(format!(
-            "(title LIKE ?{index} ESCAPE '\\'
-              OR content LIKE ?{index} ESCAPE '\\'
-              OR summary LIKE ?{index} ESCAPE '\\'
-              OR category LIKE ?{index} ESCAPE '\\')"
+            "(p.title LIKE ?{index} ESCAPE '\\'
+              OR p.content LIKE ?{index} ESCAPE '\\'
+              OR p.summary LIKE ?{index} ESCAPE '\\'
+              OR p.category LIKE ?{index} ESCAPE '\\'
+              OR EXISTS (
+                  SELECT 1 FROM prompt_tags pt
+                  INNER JOIN tags t ON t.id = pt.tag_id
+                  WHERE pt.prompt_id = p.id AND t.name LIKE ?{index} ESCAPE '\\'
+              ))"
         ));
         params.push(Box::new(term));
     }
     params.push(Box::new(SEARCH_RESULT_LIMIT as i64));
 
     let sql = format!(
-        "SELECT id, title, summary, category, updated_at, is_favorite FROM prompts
+        "SELECT p.id, p.title, p.summary, p.category, p.updated_at, p.is_favorite FROM prompts p
          WHERE {}
-         ORDER BY updated_at DESC LIMIT ?{}",
+         ORDER BY p.updated_at DESC, p.id LIMIT ?{}",
         clauses.join(" AND "),
         params.len()
     );
@@ -125,7 +159,8 @@ fn attach_tags(conn: &Connection, results: &mut [SearchResult]) -> Result<(), St
     let tag_sql = format!(
         "SELECT pt.prompt_id, t.name FROM tags t
          INNER JOIN prompt_tags pt ON t.id = pt.tag_id
-         WHERE pt.prompt_id IN ({})",
+         WHERE pt.prompt_id IN ({})
+         ORDER BY pt.prompt_id, t.name, t.id",
         placeholders.join(",")
     );
     let mut tag_stmt = conn.prepare(&tag_sql).map_err(|e| e.to_string())?;
@@ -201,14 +236,27 @@ pub(crate) fn contains_cjk(query: &str) -> bool {
 fn is_cjk(c: char) -> bool {
     matches!(
         c as u32,
-        0x2E80..=0x2EFF     // CJK Radicals Supplement
+        0x1100..=0x11FF     // Hangul Jamo
+            | 0x2E80..=0x2EFF // CJK Radicals Supplement
             | 0x3000..=0x303F // CJK Symbols and Punctuation
             | 0x3040..=0x30FF // Hiragana and Katakana
+            | 0x3130..=0x318F // Hangul Compatibility Jamo
             | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
             | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xA960..=0xA97F // Hangul Jamo Extended-A
             | 0xAC00..=0xD7AF // Hangul Syllables
+            | 0xD7B0..=0xD7FF // Hangul Jamo Extended-B
             | 0xF900..=0xFAFF // CJK Compatibility Ideographs
             | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+            | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+            | 0x2A700..=0x2B73F // CJK Unified Ideographs Extension C
+            | 0x2B740..=0x2B81F // CJK Unified Ideographs Extension D
+            | 0x2B820..=0x2CEAF // CJK Unified Ideographs Extension E
+            | 0x2CEB0..=0x2EBEF // CJK Unified Ideographs Extension F
+            | 0x2EBF0..=0x2EE5F // CJK Unified Ideographs Extension I
+            | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
+            | 0x30000..=0x3134F // CJK Unified Ideographs Extension G
+            | 0x31350..=0x323AF // CJK Unified Ideographs Extension H
     )
 }
 

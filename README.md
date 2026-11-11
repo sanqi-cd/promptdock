@@ -12,6 +12,7 @@ PromptDock 是一款运行在 macOS 上的本地优先 Prompt 管理工具，适
 - 支持配置多个 OpenAI-compatible 模型 API
 - 提供优化、结构化、精简、专家增强四种 AI 润色模式
 - 支持 AI 自动分类，并为自定义分类自动匹配图标
+- 设置页可创建 SQLite 一致性 `.db` 备份，保存到应用数据目录的 `backups/`
 - 支持暖纸色和深色两种主题
 
 ## 安装使用
@@ -22,7 +23,7 @@ PromptDock 是一款运行在 macOS 上的本地优先 Prompt 管理工具，适
 release/PromptDock_0.1.1_universal_adhoc.dmg
 ```
 
-该安装包支持 Apple Silicon 和 Intel Mac。当前版本使用 ad-hoc 签名，尚未使用 Apple Developer ID 签名和 notarization，因此首次打开时 macOS 可能会提示无法验证开发者。
+该安装包支持 Apple Silicon 和 Intel Mac。默认未配置 Apple 凭据的构建未进行代码签名，也未经过 Apple Developer ID 签名和 notarization，因此首次打开时 macOS 可能会提示无法验证开发者。
 
 完整安装和使用说明请查看：
 
@@ -41,7 +42,9 @@ PromptDock 会把 Prompt、分类、设置和模型 API Key 存储在本地 SQLi
 项目已采取的相关措施：
 
 - 数据库目录权限为 `0700`，数据库及 WAL/SHM 文件为 `0600`
+- 设置页备份通过 `VACUUM INTO` 生成一致性副本；备份目录为 `0700`、备份文件为 `0600`，但仍包含明文 API Key
 - 模型接口地址使用 URL 解析校验，拒绝 `https://api.openai.com@evil.example` 这类 userinfo 写法
+- 公网模型接口强制使用 HTTPS；HTTP 仅允许 `localhost`、`127.0.0.1` 和 `::1` 环回地址
 - API Key 与配置的 scheme/host/port 绑定：修改 Base URL 的主机时必须重新输入 Key
 - HTTP 客户端不跟随重定向，避免 Anthropic 的自定义 `x-api-key` 被跨主机转发
 - 错误响应体回显有长度上限
@@ -77,14 +80,27 @@ pnpm tauri:dev
 常用检查命令：
 
 ```bash
+pnpm typecheck
 pnpm build
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 pnpm test:e2e
 pnpm run audit:all
 ```
 
-`pnpm test:e2e` 会自动安装 Playwright Chromium，并启动 Vite dev server。
+`pnpm test:e2e` 会自动安装 Playwright Chromium 和 WebKit，并启动 Vite dev server。也可只安装浏览器：
+
+```bash
+pnpm exec playwright install chromium webkit
+```
+
+`pnpm typecheck` 分别检查 `src`、Vite/Playwright 配置和 `e2e`。npm 审计本地与 CI 都使用 high 阈值：
+
+```bash
+pnpm run audit:npm  # 等价于 pnpm audit --audit-level high
+```
+
+CI 每周一 03:17 UTC 还会自动运行完整检查和依赖审计。
 
 Rust 依赖审计需要先安装 `cargo-audit`：
 
@@ -94,17 +110,42 @@ cargo install cargo-audit --locked
 
 ## 构建
 
-生成 macOS `.app`：
+以下命令均从仓库根目录执行，版本以 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的 `0.1.1` 为准。
+
+生成当前 Mac 架构的 `.app`：
 
 ```bash
 pnpm tauri:build
 ```
 
-生成 DMG：
+生成同时支持 Apple Silicon 和 Intel 的 universal DMG。先安装两个 Rust target，再使用锁文件安装前端依赖并构建：
 
 ```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+pnpm install --frozen-lockfile
 pnpm tauri:build:dmg
 ```
+
+`pnpm tauri:build:dmg` 固定执行以下命令，`--locked` 防止 Cargo 在发布构建时改写依赖锁文件：
+
+```bash
+pnpm tauri build --target universal-apple-darwin --bundles dmg -- --locked
+```
+
+DMG 输出到 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。生成配套校验文件：
+
+```bash
+(cd src-tauri/target/universal-apple-darwin/release/bundle/dmg && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+```
+
+### 可选签名、公证与 tag 发布
+
+不提供 Apple 凭据时，构建产物未进行代码签名且未经公证。正式分发可在 GitHub 仓库 secrets 中配置：
+
+- 签名：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`
+- 公证：`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`（app-specific password，不是 Apple 账户密码）
+
+两组都可省略，但同一组必须完整；启用公证前必须启用签名。推送与当前版本一致的 tag（例如 `v0.1.1`）会触发 `.github/workflows/release.yml`，构建并上传 DMG 与 `SHA256SUMS.txt`。workflow 会在配置签名时执行 `codesign --verify`，配置公证时执行 `xcrun stapler validate`，不会把缺少 secrets 的构建描述为已签名或已公证。
 
 如需正式面向普通用户分发，建议补齐 Apple Developer ID 签名、notarization 和 stapling。
 
@@ -116,6 +157,7 @@ pnpm tauri:build:dmg
 - Prompt 元数据：`toggle_favorite`、`get_prompt_tags`、`set_prompt_tags`、`search_prompts`
 - AI 能力：`polish_prompt`、`polish_prompt_stream`（含 `requestId` 参数）、`cancel_polish_stream`（按 `requestId` 取消流式润色，幂等）、`analyze_polish_process`、`auto_classify`、`test_connection`
 - API 配置：`list_api_configs`、`get_active_config`、`save_api_config`、`update_api_config`、`delete_api_config`、`activate_api_config`
+- 数据备份：`backup_database`（通过 `VACUUM INTO` 在应用数据目录的 `backups/` 创建一致性 `.db` 备份并返回路径）
 
 ## 许可证
 

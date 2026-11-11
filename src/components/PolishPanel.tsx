@@ -26,6 +26,7 @@ const PROCESS_ANALYSIS_DELAY_MS = 800;
 export function PolishPanel() {
   const [mode, setMode] = useState<PolishMode>("general");
   const [result, setResult] = useState<string | null>(null);
+  const [resultSourceContent, setResultSourceContent] = useState<string | null>(null);
   const [processSteps, setProcessSteps] = useState<PolishProcessStep[]>([]);
   const [processError, setProcessError] = useState<string | null>(null);
   const [isAnalyzingProcess, setIsAnalyzingProcess] = useState(false);
@@ -49,7 +50,11 @@ export function PolishPanel() {
   useEffect(() => {
     if (lastEditSessionRef.current === editSession) return;
     lastEditSessionRef.current = editSession;
+    // 同时作废处理要点等不可取消的辅助请求；仅取消主流还不够，否则旧 Prompt 的
+    // analyzePolishProcess 迟到响应仍可能在切换后重新写回进度卡片。
+    polishRunIdRef.current += 1;
     setResult(null);
+    setResultSourceContent(null);
     setProcessSteps([]);
     setProcessError(null);
     setIsAnalyzingProcess(false);
@@ -108,9 +113,11 @@ export function PolishPanel() {
       addToast("请先在设置中配置并激活一个模型 API", "error");
       return;
     }
-    const sourceContent = content.trim();
+    const sourceContent = content;
+    const polishedInput = sourceContent.trim();
     const sourceMode = mode;
     setResult(null);
+    setResultSourceContent(sourceContent);
     setProcessSteps([]);
     setProcessError(null);
 
@@ -126,7 +133,7 @@ export function PolishPanel() {
         }
 
         setIsAnalyzingProcess(true);
-        void analyzePolishProcess(sourceContent, sourceMode)
+        void analyzePolishProcess(polishedInput, sourceMode)
           .then((steps) => {
             if (isCurrentRun()) {
               setProcessSteps(steps);
@@ -144,7 +151,7 @@ export function PolishPanel() {
           });
       }, PROCESS_ANALYSIS_DELAY_MS);
 
-      const optimized = await polishPromptStream(sourceMode, sourceContent, (delta) => {
+      const optimized = await polishPromptStream(sourceMode, polishedInput, (delta) => {
         if (!isCurrentRun()) {
           return;
         }
@@ -194,8 +201,13 @@ export function PolishPanel() {
 
   const handleApply = () => {
     if (result) {
+      if (usePromptStore.getState().content !== resultSourceContent) {
+        addToast("原文已继续编辑，未替换；请复制结果后手动合并", "error");
+        return;
+      }
       usePromptStore.getState().setContent(result);
       setResult(null);
+      setResultSourceContent(null);
       addToast("已替换原文", "success");
     }
   };

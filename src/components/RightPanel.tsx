@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { usePromptStore } from "@/stores/promptStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useCategoryStore } from "@/stores/categoryStore";
+import { CATEGORIES } from "@/components/CategoryTags";
 import { useToast } from "@/components/ui/toast";
 import { DiscardConfirmModal } from "@/components/DiscardConfirmModal";
 import { getErrorMessage } from "@/lib/utils";
@@ -17,7 +19,7 @@ export function RightPanel({ context }: RightPanelProps) {
   const summary = usePromptStore((s) => s.summary);
   const tags = usePromptStore((s) => s.tags);
   const isClassifying = usePromptStore((s) => s.isClassifying);
-  const prompts = usePromptStore((s) => s.prompts);
+  const prompts = usePromptStore((s) => s.allPrompts);
   const savePrompt = usePromptStore((s) => s.savePrompt);
   const toggleFavorite = usePromptStore((s) => s.toggleFavorite);
   const autoClassify = usePromptStore((s) => s.autoClassify);
@@ -25,6 +27,7 @@ export function RightPanel({ context }: RightPanelProps) {
   const newPrompt = usePromptStore((s) => s.newPrompt);
 
   const activeConfig = useSettingsStore((s) => s.activeConfig);
+  const customCategories = useCategoryStore((s) => s.customCategories);
   const { addToast } = useToast();
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
@@ -81,11 +84,22 @@ export function RightPanel({ context }: RightPanelProps) {
       addToast("请先在设置中配置并激活一个模型 API", "error");
       return;
     }
+    const classifySession = usePromptStore.getState().editSession;
     try {
       if (!usePromptStore.getState().currentId) {
         await savePrompt();
       }
-      const result = await autoClassify();
+      const current = usePromptStore.getState();
+      // 保存等待期间可能已经新建或加载其他 Prompt。保存队列会把旧会话的
+      // 请求静默跳过并正常 resolve，不能因此对新记录发起分类和计费请求。
+      if (current.editSession !== classifySession) {
+        throw new Error("编辑目标已切换，已取消自动分类");
+      }
+      if (!current.currentId) {
+        throw new Error("Prompt 尚未保存，无法自动分类");
+      }
+      const categories = [...new Set([...CATEGORIES, ...customCategories])];
+      const result = await autoClassify(categories);
       await applyClassifyResult(result);
       addToast("自动分类完成", "success");
     } catch (e) {
@@ -128,7 +142,7 @@ export function RightPanel({ context }: RightPanelProps) {
                     <InfoRow label="分类" value={category || "—"} dot="#A78BFA" />
                     <InfoRow label="标签" value={tags.length > 0 ? tags.join("、") : "—"} />
                     <InfoRow label="预计用途" value={summary ? summary.slice(0, 20) : "—"} />
-                    <InfoRow label="推荐工具" value={activeConfig.model} />
+                    <InfoRow label="当前模型" value={activeConfig.model} />
                     <button
                       onClick={handleAutoClassify}
                       disabled={isClassifying || !content.trim()}

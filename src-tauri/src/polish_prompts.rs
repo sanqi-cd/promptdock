@@ -114,6 +114,10 @@ const EXPERT_POLISH_PROMPT: &str = r#"你是 PromptDock 的「专家增强」ski
 - 明确包含任务角色、目标、背景假设、执行步骤、输出格式、约束条件和质量标准。
 - 输出应像一份可交给专家模型执行的正式任务说明。"#;
 
+/// 默认可选分类。自定义分类由前端一并传入，避免模型只能写入用户看不到的分类。
+pub const DEFAULT_CLASSIFY_CATEGORIES: &str =
+    "内容创作、代码开发、学习研究、销售营销、数据分析、图像生成、工作汇报、产品设计、视频脚本、其他";
+
 /// 自动分类的系统提示词。分类枚举同时被 `categoryIcons` 前端使用，改动需同步。
 pub const CLASSIFY_SYSTEM_PROMPT: &str = r#"你是一个提示词分类专家。分析用户给出的提示词，返回严格的 JSON 格式结果。
 
@@ -130,6 +134,15 @@ JSON 格式要求：
 }
 
 只返回 JSON，不要包含其他内容。"#;
+
+/// 生成包含当前自定义分类的提示词；空列表保持默认提示词不变。
+pub fn classify_system_prompt(categories: &[String]) -> String {
+    if categories.is_empty() {
+        return CLASSIFY_SYSTEM_PROMPT.to_string();
+    }
+
+    CLASSIFY_SYSTEM_PROMPT.replace(DEFAULT_CLASSIFY_CATEGORIES, &categories.join("、"))
+}
 
 /// 把用户选择的润色模式映射到对应的系统提示词；未知模式回退到「优化」。
 pub fn polish_system_prompt(mode: &str) -> &'static str {
@@ -236,5 +249,15 @@ mod tests {
                 "分类提示词缺少 {category}"
             );
         }
+    }
+
+    #[test]
+    fn classify_prompt_includes_custom_categories() {
+        let categories = vec!["内容创作".to_string(), "私人知识库".to_string()];
+        let prompt = classify_system_prompt(&categories);
+
+        assert!(prompt.contains("内容创作、私人知识库"));
+        assert!(!prompt.contains(DEFAULT_CLASSIFY_CATEGORIES));
+        assert_eq!(classify_system_prompt(&[]), CLASSIFY_SYSTEM_PROMPT);
     }
 }

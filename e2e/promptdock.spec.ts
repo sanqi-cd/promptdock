@@ -143,7 +143,9 @@ test.describe("PromptEditor 编辑器", () => {
           }
           if (cmd === "polish_prompt") {
             polishCalls.push({ cmd, ...args });
-            await new Promise((resolve) => window.setTimeout(resolve, 1200));
+            // 过程要点在 800ms 后才开始；保留充足窗口，避免高负载构建并行时
+            // 最终结果先于要点断言到达而造成 flaky。
+            await new Promise((resolve) => window.setTimeout(resolve, 2500));
             return `优化后的 ${args?.content ?? ""}`;
           }
           if (cmd === "create_prompt") {
@@ -517,9 +519,21 @@ test.describe("PromptEditor 编辑器", () => {
   test("格式工具栏 7 个按钮可见", async ({ page }) => {
     await page.goto(BASE);
     const toolbar = page.locator("main button[title]");
-    const titles = await toolbar.allTextContents();
-    // Should have format buttons with titles
-    expect(titles.length).toBeGreaterThanOrEqual(1);
+    await expect(toolbar).toHaveCount(7);
+    await expect(
+      toolbar.evaluateAll((buttons) => buttons.map((button) => button.getAttribute("title")))
+    ).resolves.toEqual([
+      "粗体",
+      "斜体",
+      "删除线",
+      "行内代码",
+      "无序列表",
+      "链接",
+      "插入图片链接",
+    ]);
+    for (const button of await toolbar.all()) {
+      await expect(button).toBeVisible();
+    }
   });
 
   test("粗体按钮插入 Markdown 语法", async ({ page }) => {
@@ -631,13 +645,21 @@ test.describe("PromptListView 列表视图", () => {
   });
 
   test("空列表显示空状态", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs" || cmd === "list_prompts") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
     await page.goto(BASE);
     await page.locator("nav button", { hasText: "全部 Prompt" }).click();
-    const emptyText = page.locator("text=暂无 Prompt");
-    // 可能显示也可能不显示，取决于是否已有数据
-    const count = await page.locator("text=暂无 Prompt").count();
-    // 至少页面不崩溃
-    expect(count).toBeGreaterThanOrEqual(0);
+    await expect(page.getByText("暂无 Prompt", { exact: true })).toBeVisible();
+    await expect(page.getByText("未找到匹配的 Prompt", { exact: true })).toHaveCount(0);
   });
 });
 
@@ -688,12 +710,21 @@ test.describe("SettingsPage 设置页面", () => {
   });
 
   test("空状态提示正常", async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs" || cmd === "list_prompts") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
     await page.goto(BASE);
     await page.locator("aside button", { hasText: "设置" }).click();
-    // 可能显示空状态，取决于是否有配置
-    const emptyHint = page.locator("text=暂无 API 配置");
-    const count = await emptyHint.count();
-    expect(count).toBeGreaterThanOrEqual(0);
+    await expect(page.getByText("暂无 API 配置", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "添加第一个配置" })).toBeVisible();
   });
 });
 
@@ -721,16 +752,40 @@ test.describe("交叉导航", () => {
   });
 
   test("点击列表卡片加载到编辑器", async ({ page }) => {
+    await page.addInitScript(() => {
+      const prompt = {
+        id: "prompt-fixed",
+        title: "固定标题",
+        content: "固定正文",
+        content_preview: "固定正文",
+        optimized_content: null,
+        category: null,
+        summary: null,
+        is_favorite: false,
+        created_at: "2026-01-01 00:00:00",
+        updated_at: "2026-01-01 00:00:00",
+        last_used_at: null,
+      };
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd: string) => {
+          if (cmd === "list_api_configs") return [];
+          if (cmd === "list_prompts") return [prompt];
+          if (cmd === "get_prompt") return prompt;
+          if (cmd === "get_prompt_tags") return [];
+          return null;
+        },
+        transformCallback: () => 1,
+        unregisterCallback: () => {},
+        runCallback: () => {},
+      };
+    });
     await page.goto(BASE);
     await page.locator("nav button", { hasText: "全部 Prompt" }).click();
-    // 如果有 prompt 卡片，点击第一个
-    const card = page.locator("main .rounded-xl button").first();
-    const cardCount = await card.count();
-    if (cardCount > 0) {
-      await card.click();
-      // 应该切换到编辑器视图
-      await expect(page.locator("textarea").first()).toBeVisible();
-    }
+    const card = page.getByRole("button", { name: /固定标题/ });
+    await expect(card).toBeVisible();
+    await card.click();
+    await expect(page.locator("textarea").first()).toHaveValue("固定正文");
+    await expect(page.locator("main").getByText("固定标题", { exact: true })).toBeVisible();
   });
 });
 
@@ -788,7 +843,7 @@ test.describe("错误提示", () => {
                 {
                   id: "recovered",
                   title: "恢复后的记录",
-                  content: "内容",
+                  content_preview: "内容",
                   optimized_content: null,
                   category: null,
                   summary: null,
@@ -879,7 +934,7 @@ test.describe("时间戳展示", () => {
               {
                 id: "p1",
                 title: "时间戳用例",
-                content: "内容",
+                content_preview: "内容",
                 optimized_content: null,
                 category: null,
                 summary: null,
@@ -924,7 +979,7 @@ test.describe("时间戳展示", () => {
           {
             id: "p-bad",
             title: "坏时间戳",
-            content: "内容",
+            content_preview: "内容",
             optimized_content: null,
             category: null,
             summary: null,
@@ -1024,7 +1079,7 @@ test.describe("列表筛选竞态", () => {
           Array.from({ length: 2 }, (_, i) => ({
             id: `${prefix}-${i}`,
             title: `${prefix}-${i}`,
-            content: "内容",
+            content_preview: "内容",
             optimized_content: null,
             category: null,
             summary: null,
@@ -1087,7 +1142,7 @@ test.describe("搜索与列表模式隔离", () => {
               {
                 id: "all-list-0",
                 title: "全部项-0",
-                content: "内容",
+                content_preview: "内容",
                 optimized_content: null,
                 category: null,
                 summary: null,
@@ -1286,7 +1341,7 @@ test.describe("在途加载不覆盖新建", () => {
               {
                 id: "slow-1",
                 title: "旧 Prompt",
-                content: "旧内容",
+                content: "旧内容", content_preview: "旧内容",
                 optimized_content: null,
                 category: null,
                 summary: null,
@@ -1303,7 +1358,7 @@ test.describe("在途加载不覆盖新建", () => {
             return {
               id: "slow-1",
               title: "旧 Prompt",
-              content: "旧内容",
+              content: "旧内容", content_preview: "旧内容",
               optimized_content: null,
               category: null,
               summary: null,
@@ -1566,7 +1621,7 @@ test.describe("切换 Prompt 前保存未落库的编辑", () => {
   const promptB = {
     id: "prompt-b",
     title: "B 的标题",
-    content: "B 的正文",
+    content: "B 的正文", content_preview: "B 的正文",
     optimized_content: null,
     category: null,
     summary: null,
@@ -1685,7 +1740,7 @@ test.describe("润色结果随编辑目标切换清空", () => {
   const promptB = {
     id: "prompt-b",
     title: "B 的标题",
-    content: "B 的正文",
+    content: "B 的正文", content_preview: "B 的正文",
     optimized_content: null,
     category: null,
     summary: null,
@@ -1834,7 +1889,7 @@ test.describe("自动保存脏检查", () => {
       const prompt = {
         id: "prompt-b",
         title: "B 的标题",
-        content: "B 的正文",
+        content: "B 的正文", content_preview: "B 的正文",
         optimized_content: null,
         category: null,
         summary: null,
@@ -1930,7 +1985,7 @@ test.describe("全局搜索弹窗状态清理", () => {
       const prompt = {
         id: "prompt-b",
         title: "B 的标题",
-        content: "B 的正文",
+        content: "B 的正文", content_preview: "B 的正文",
         optimized_content: null,
         category: null,
         summary: null,
@@ -1995,7 +2050,7 @@ test.describe("详情页读取失败", () => {
       const prompt = {
         id: "prompt-b",
         title: "B 的标题",
-        content: "B 的正文",
+        content: "B 的正文", content_preview: "B 的正文",
         optimized_content: null,
         category: null,
         summary: null,

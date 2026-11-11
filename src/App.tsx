@@ -39,16 +39,16 @@ function App() {
   const [showDiscardModal, setShowDiscardModal] = useState(false);
 
   const loadConfigs = useSettingsStore((s) => s.loadConfigs);
+  const loadAllPrompts = usePromptStore((s) => s.loadAllPrompts);
   const loadPrompts = usePromptStore((s) => s.loadPrompts);
   const theme = useThemeStore((s) => s.theme);
 
   useEffect(() => {
     loadConfigs();
-    // Load prompts up front: the sidebar counts, the explore view and the right
-    // panel all derive from `prompts`, and only the list view used to fetch them
-    // — so a cold start showed "no prompts yet" on data that existed.
+    // 全局统计与当前筛选列表各自加载，互不受筛选条件和响应顺序影响。
+    loadAllPrompts();
     loadPrompts();
-  }, [loadConfigs, loadPrompts]);
+  }, [loadConfigs, loadAllPrompts, loadPrompts]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -111,9 +111,10 @@ function App() {
   }, []);
 
   const handleSelectCategory = useCallback((cat: string) => {
-    // 这条路径不经过 handleNavigate，同样要清掉上一轮搜索。
+    // 这条路径不经过 handleNavigate，同样要清掉上一轮搜索和收藏过滤。
     const store = usePromptStore.getState();
     store.clearSearch();
+    store.setFavoriteOnly(false);
     store.setSelectedCategory(cat);
     setListMode("category");
     setMainView("list");

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use tauri::State;
 use uuid::Uuid;
 
@@ -43,7 +43,15 @@ pub(crate) fn validate_base_url(base_url: &str) -> Result<(), String> {
         reqwest::Url::parse(base_url).map_err(|_| "Base URL 不是合法的 URL".to_string())?;
 
     match parsed.scheme() {
-        "http" | "https" => {}
+        "https" => {}
+        "http" => {
+            let is_loopback = parsed
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
+            if !is_loopback {
+                return Err("HTTP Base URL 仅允许 localhost、127.0.0.1 或 ::1".to_string());
+            }
+        }
         _ => return Err("Base URL 必须以 http:// 或 https:// 开头".to_string()),
     }
 
@@ -102,7 +110,7 @@ pub fn list_api_configs(state: State<DbState>) -> Result<Vec<ApiConfig>, String>
     let mut stmt = conn
         .prepare(
             "SELECT id, name, provider, base_url, model, is_active, created_at
-             FROM api_configs ORDER BY created_at DESC",
+             FROM api_configs ORDER BY created_at DESC, id DESC",
         )
         .map_err(|e| e.to_string())?;
 
@@ -130,7 +138,7 @@ pub fn get_active_config(state: State<DbState>) -> Result<Option<ApiConfig>, Str
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     conn.query_row(
         "SELECT id, name, provider, base_url, model, is_active, created_at
-         FROM api_configs WHERE is_active = 1 LIMIT 1",
+         FROM api_configs WHERE is_active = 1 ORDER BY created_at DESC, id DESC LIMIT 1",
         [],
         |row| {
             Ok(ApiConfig {
@@ -170,24 +178,41 @@ pub fn save_api_config(
     validate_config_fields(&name, &provider, &base_url, &model)?;
     validate_api_key(&api_key)?;
 
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    let id = Uuid::new_v4().to_string();
-    let now = sql_now(&conn);
+    let mut conn = state.0.lock().map_err(|e| e.to_string())?;
+    save_api_config_impl(&mut conn, name, provider, base_url, api_key, model)
+}
 
-    // If this is the first config, set it as active.
+fn save_api_config_impl(
+    conn: &mut Connection,
+    name: String,
+    provider: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+) -> Result<ApiConfig, String> {
+    // COUNT + INSERT 必须在写事务里完成：两个连接同时看到 COUNT=0 时，
+    // deferred 事务可能双双准备插入首条 active 配置。IMMEDIATE 在 COUNT 前
+    // 取得写锁，配合 partial unique index 保证只有一条 active。
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let id = Uuid::new_v4().to_string();
+    let now = sql_now(&tx)?;
+
     // 不能 unwrap_or(0)：查询失败会被当成「没有任何配置」，从而把这条配置
     // 静默设为 active，打乱用户已有的激活状态，且真实错误被吞掉。
-    let existing_count: i64 = conn
+    let existing_count: i64 = tx
         .query_row("SELECT COUNT(*) FROM api_configs", [], |row| row.get(0))
         .map_err(|e| e.to_string())?;
     let is_active = existing_count == 0;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO api_configs (id, name, provider, base_url, api_key, model, is_active, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![id, name, provider, base_url, api_key, model, is_active as i32, now],
     )
     .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
 
     Ok(ApiConfig {
         id,
@@ -289,7 +314,7 @@ pub fn delete_api_config(state: State<DbState>, id: String) -> Result<(), String
         tx.execute(
             "UPDATE api_configs SET is_active = 1
              WHERE id = (
-                 SELECT id FROM api_configs ORDER BY created_at DESC LIMIT 1
+                 SELECT id FROM api_configs ORDER BY created_at DESC, id DESC LIMIT 1
              )",
             [],
         )
@@ -323,9 +348,13 @@ pub fn activate_api_config(state: State<DbState>, id: String) -> Result<(), Stri
 // Helper: get the active config's ApiSettings for use by ai.rs
 pub fn get_active_settings(state: &State<DbState>) -> Result<crate::ai::ApiSettings, String> {
     let conn = state.0.lock().map_err(|e| e.to_string())?;
+    get_active_settings_impl(&conn)
+}
+
+fn get_active_settings_impl(conn: &Connection) -> Result<crate::ai::ApiSettings, String> {
     let config = conn
         .query_row(
-            "SELECT id, provider, base_url, api_key, model FROM api_configs WHERE is_active = 1 LIMIT 1",
+            "SELECT id, provider, base_url, api_key, model FROM api_configs WHERE is_active = 1 ORDER BY created_at DESC, id DESC LIMIT 1",
             [],
             |row| {
                 Ok(crate::ai::ApiSettings {
@@ -346,6 +375,11 @@ pub fn get_active_settings(state: &State<DbState>) -> Result<crate::ai::ApiSetti
             other => format!("读取 API 配置失败: {}", other),
         })?;
 
+    // 老库可能保存于校验收紧之前，不能把历史 HTTP 非环回地址当作可信
+    // 配置继续发送 API Key；每次真正读取用于请求的设置时重新校验。
+    validate_base_url(&config.base_url)
+        .map_err(|e| format!("当前 API 配置的 Base URL 无效: {e}"))?;
+
     if config.api_key.trim().is_empty() {
         return Err("未找到 API Key，请在设置中重新输入并保存该模型配置".to_string());
     }
@@ -353,9 +387,11 @@ pub fn get_active_settings(state: &State<DbState>) -> Result<crate::ai::ApiSetti
     Ok(config)
 }
 
-fn sql_now(conn: &Connection) -> String {
-    conn.query_row("SELECT datetime('now', 'localtime')", [], |row| row.get(0))
-        .unwrap_or_else(|_| String::from("unknown"))
+fn sql_now(conn: &Connection) -> Result<String, String> {
+    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| format!("读取数据库时间失败: {}", e))
 }
 
 #[cfg(test)]
@@ -448,8 +484,22 @@ mod tests {
     fn validate_base_url_allows_local_http_endpoints() {
         assert!(validate_base_url("http://localhost:11434/v1").is_ok());
         assert!(validate_base_url("http://127.0.0.1:1234/v1").is_ok());
+        assert!(validate_base_url("http://[::1]:11434/v1").is_ok());
         assert!(validate_base_url("https://api.openai.com/v1").is_ok());
         assert!(validate_base_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_plain_http_beyond_loopback() {
+        for url in [
+            "http://api.openai.com/v1",
+            "http://192.168.1.10/v1",
+            "http://localhost.evil.example/v1",
+            "http://[2001:db8::1]/v1",
+        ] {
+            let error = validate_base_url(url).expect_err(url);
+            assert!(error.contains("仅允许"), "意外错误: {error}");
+        }
     }
 
     #[test]
@@ -471,6 +521,72 @@ mod tests {
             validate_config_fields(&name, VALID_PROVIDER, VALID_URL, VALID_MODEL).is_ok(),
             "{MAX_FIELD_LEN} 个汉字应当合法"
         );
+    }
+
+    #[test]
+    fn save_api_config_makes_only_the_first_config_active() {
+        let mut conn = Connection::open_in_memory().expect("open database");
+        crate::db::init_schema(&conn).expect("init schema");
+
+        let first = save_api_config_impl(
+            &mut conn,
+            VALID_NAME.to_string(),
+            VALID_PROVIDER.to_string(),
+            VALID_URL.to_string(),
+            "sk-first".to_string(),
+            VALID_MODEL.to_string(),
+        )
+        .expect("save first config");
+        let second = save_api_config_impl(
+            &mut conn,
+            "第二个".to_string(),
+            VALID_PROVIDER.to_string(),
+            VALID_URL.to_string(),
+            "sk-second".to_string(),
+            VALID_MODEL.to_string(),
+        )
+        .expect("save second config");
+
+        assert!(first.is_active);
+        assert!(!second.is_active);
+        assert!(first.created_at.ends_with('Z'));
+        assert!(first.created_at.contains('T'));
+        let active_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM api_configs WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count active configs");
+        assert_eq!(active_count, 1);
+
+        let duplicate_active = conn.execute(
+            "UPDATE api_configs SET is_active = 1 WHERE id = ?1",
+            rusqlite::params![second.id],
+        );
+        assert!(
+            duplicate_active.is_err(),
+            "partial unique index 必须拒绝第二个 active"
+        );
+    }
+
+    #[test]
+    fn active_settings_revalidate_legacy_base_urls() {
+        let conn = Connection::open_in_memory().expect("open database");
+        crate::db::init_schema(&conn).expect("init schema");
+        conn.execute(
+            "INSERT INTO api_configs (
+                 id, name, provider, base_url, api_key, model, is_active, created_at
+             ) VALUES (
+                 'legacy', '旧配置', 'openai', 'http://api.openai.com/v1',
+                 'sk-secret', 'gpt-4', 1, '2026-01-01T00:00:00Z'
+             )",
+            [],
+        )
+        .expect("insert legacy config");
+
+        let error = get_active_settings_impl(&conn).expect_err("legacy URL must be rejected");
+        assert!(error.contains("Base URL 无效"), "意外错误: {error}");
     }
 
     #[test]

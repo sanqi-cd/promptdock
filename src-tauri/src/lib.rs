@@ -1,5 +1,6 @@
 mod ai;
 mod api_configs;
+mod backup;
 mod commands;
 mod db;
 mod models;
@@ -48,6 +49,7 @@ pub fn run() {
             api_configs::update_api_config,
             api_configs::delete_api_config,
             api_configs::activate_api_config,
+            backup::backup_database,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

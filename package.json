@@ -10,15 +10,16 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json && tsc -p tsconfig.e2e.json",
     "test:e2e": "playwright install chromium webkit && playwright test",
-    "audit:npm": "pnpm audit --audit-level moderate",
+    "audit:npm": "pnpm audit --audit-level high",
     "audit:rust": "cd src-tauri && cargo audit --stale",
     "audit:rust:strict": "cd src-tauri && cargo audit --deny warnings --stale",
     "audit:all": "pnpm run audit:npm && pnpm run audit:rust",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build --bundles app",
-    "tauri:build:dmg": "tauri build --bundles dmg"
+    "tauri:build:dmg": "tauri build --target universal-apple-darwin --bundles dmg -- --locked"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -40,6 +41,7 @@
   "devDependencies": {
     "@playwright/test": "^1.64.1",
     "@tauri-apps/cli": "^2.12.3",
+    "@types/node": "^22.20.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.2",
