@@ -89,8 +89,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Tauri treats empty exported Apple credentials as configured.
           if [[ "${signing}" == 0 ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
             export APPLE_SIGNING_IDENTITY=-
+          fi
+          if [[ "${notarizing}" == 0 ]]; then
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
           fi
           pnpm tauri:build:dmg
 
