@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 90
     env:
       # 均可选：完整配置签名 secrets 才使用 Developer ID；完整配置公证
-      # secrets 才启用 Apple notarization。缺失时明确发布未签名、未公证产物。
+      # secrets 才启用 Apple notarization。未提供签名配置时使用临时签名。
       APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
       APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -82,21 +82,27 @@ jobs:
           {
             echo "signing=${signing}"
             echo "notarizing=${notarizing}"
+            echo "dmg_path=src-tauri/target/universal-apple-darwin/release/bundle/dmg/PromptDock_${version}_universal.dmg"
           } >> "${GITHUB_ENV}"
 
       - name: 构建 universal DMG
-        run: pnpm tauri:build:dmg
-
-      - name: 验证 DMG 内应用的实际签名与 stapling 状态
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
-          if (( ${#dmgs[@]} == 0 )); then
-            echo "未找到待验证的 universal DMG。"
+          if [[ "${signing}" == 0 ]]; then
+            export APPLE_SIGNING_IDENTITY=-
+          fi
+          pnpm tauri:build:dmg
+
+      - name: 验证 DMG 完整性、双架构与应用签名
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${dmg_path}" ]]; then
+            echo "未找到当前版本的 universal DMG：${dmg_path}"
             exit 1
           fi
+          hdiutil verify "${dmg_path}"
           # CI 构建会在 DMG 完成后清理中间 .app，必须验证最终 DMG 内的应用，
           # 而不是已经不存在、且可能与安装包内容不同的 bundle/macos 路径。
           mount_dir="$(mktemp -d /tmp/promptdock-release-verify.XXXXXX)"
@@ -105,10 +111,20 @@ jobs:
             rmdir "${mount_dir}" 2>/dev/null || true
           }
           trap cleanup EXIT
-          hdiutil attach -readonly -nobrowse -mountpoint "${mount_dir}" "${dmgs[0]}"
+          hdiutil attach -readonly -nobrowse -mountpoint "${mount_dir}" "${dmg_path}"
           app="${mount_dir}/PromptDock.app"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app}/Contents/Info.plist")"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "安装包版本 v${version} 与发布 tag ${GITHUB_REF_NAME} 不一致。"
+            exit 1
+          fi
+          lipo "${app}/Contents/MacOS/promptdock" -verify_arch arm64 x86_64
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          signature="$(codesign --display --verbose=2 "${app}" 2>&1)"
           if [[ "${signing}" == 1 ]]; then
-            codesign --verify --deep --strict --verbose=2 "${app}"
+            grep -q '^Authority=Developer ID Application:' <<< "${signature}"
+          else
+            grep -q '^Signature=adhoc$' <<< "${signature}"
           fi
           if [[ "${notarizing}" == 1 ]]; then
             xcrun stapler validate "${app}"
@@ -119,21 +135,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-artifacts
-          shopt -s nullglob
-          dmgs=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
-          if (( ${#dmgs[@]} == 0 )); then
-            echo "未找到 universal DMG。"
-            exit 1
-          fi
-          cp "${dmgs[@]}" release-artifacts/
-          (cd release-artifacts && shasum -a 256 ./*.dmg > SHA256SUMS.txt)
+          cp "${dmg_path}" release-artifacts/
+          (cd release-artifacts && shasum -a 256 "${dmg_path##*/}" > SHA256SUMS.txt)
           {
             echo "PromptDock ${GITHUB_REF_NAME}（macOS universal，Apple Silicon + Intel）"
             echo
             if [[ "${signing}" == 1 ]]; then
               echo "- Developer ID 签名已通过 codesign 验证。"
             else
-              echo "- 未配置 Developer ID secrets；产物未进行代码签名。"
+              echo "- 应用已通过临时签名验证，未使用 Apple Developer ID 签名。"
             fi
             if [[ "${notarizing}" == 1 ]]; then
               echo "- Apple 公证票据已通过 stapler validate 验证。"
@@ -148,10 +158,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          dmgs=(release-artifacts/*.dmg)
           gh release create "${GITHUB_REF_NAME}" \
-            "${dmgs[@]}" \
+            "release-artifacts/${dmg_path##*/}" \
             release-artifacts/SHA256SUMS.txt \
+            --verify-tag \
             --title "PromptDock ${GITHUB_REF_NAME}" \
             --notes-file release-artifacts/RELEASE_NOTES.md

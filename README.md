@@ -17,23 +17,13 @@ PromptDock 是一款运行在 macOS 上的本地优先 Prompt 管理工具，适
 
 ## 安装使用
 
-项目内置了一个预览版 macOS universal DMG：
+从 [GitHub Releases](https://github.com/sanqi-cd/promptdock/releases/latest) 下载 macOS universal DMG 和同一版本的 `SHA256SUMS.txt`。同一个安装包支持 Apple Silicon 和 Intel Mac。
 
-```text
-release/PromptDock_0.1.1_universal.dmg
-```
-
-该安装包支持 Apple Silicon 和 Intel Mac。默认未配置 Apple 凭据的构建未进行代码签名，也未经过 Apple Developer ID 签名和 notarization，因此首次打开时 macOS 可能会提示无法验证开发者。
+未配置 Apple 凭据时，应用使用临时签名（ad-hoc），没有 Apple Developer ID 签名和公证。首次打开时，macOS 可能会提示无法验证开发者。
 
 完整安装和使用说明请查看：
 
 [PromptDock 使用说明](docs/user-guide.md)
-
-安装包校验值见：
-
-```text
-release/SHA256SUMS.txt
-```
 
 ## 安全说明
 
@@ -110,7 +100,7 @@ cargo install cargo-audit --locked
 
 ## 构建
 
-以下命令均从仓库根目录执行，版本以 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的 `0.1.1` 为准。
+以下命令均从仓库根目录执行。`package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本应保持一致。
 
 生成当前 Mac 架构的 `.app`：
 
@@ -140,12 +130,12 @@ DMG 输出到 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。�
 
 ### 可选签名、公证与 tag 发布
 
-不提供 Apple 凭据时，构建产物未进行代码签名且未经公证。正式分发可在 GitHub 仓库 secrets 中配置：
+不提供 Apple 凭据时，发布流程使用临时签名，不进行公证。正式分发可在 GitHub 仓库 secrets 中配置：
 
 - 签名：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`
 - 公证：`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`（app-specific password，不是 Apple 账户密码）
 
-两组都可省略，但同一组必须完整；启用公证前必须启用签名。推送与当前版本一致的 tag（例如 `v0.1.1`）会触发 `.github/workflows/release.yml`，构建并上传 DMG 与 `SHA256SUMS.txt`。workflow 会在配置签名时执行 `codesign --verify`，配置公证时执行 `xcrun stapler validate`，不会把缺少 secrets 的构建描述为已签名或已公证。
+两组都可省略，但同一组必须完整；启用公证前必须启用 Developer ID 签名。CI 通过后，推送与应用版本一致的 tag（例如 `v0.1.2`），会触发 `.github/workflows/release.yml`。发布流程验证 DMG 的完整性、双架构和签名，启用公证时还会验证公证票据，然后将 DMG 和 `SHA256SUMS.txt` 上传到 GitHub Releases。
 
 如需正式面向普通用户分发，建议补齐 Apple Developer ID 签名、notarization 和 stapling。
 

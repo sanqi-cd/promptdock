@@ -304,6 +304,15 @@ mod tests {
     }
 
     #[test]
+    fn bundled_sqlite_includes_the_wal_memory_disclosure_fix() {
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "SQLite {} is older than 3.54.0, which fixes CVE-2026-119375",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
     fn test_init_db() {
         let db_path = TestDbPath::new("init");
         let conn = init_db(&db_path.0).expect("Failed to init test db");

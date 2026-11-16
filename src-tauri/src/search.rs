@@ -12,7 +12,7 @@ use rusqlite::Connection;
 
 use crate::models::SearchResult;
 
-const SEARCH_RESULT_LIMIT: usize = 50;
+const SEARCH_RESULT_LIMIT: i64 = 50;
 
 pub(crate) fn search_prompts_impl(
     conn: &Connection,
@@ -132,7 +132,7 @@ fn like_search(conn: &Connection, query: &str) -> Result<Vec<SearchResult>, Stri
         ));
         params.push(Box::new(term));
     }
-    params.push(Box::new(SEARCH_RESULT_LIMIT as i64));
+    params.push(Box::new(SEARCH_RESULT_LIMIT));
 
     let sql = format!(
         "SELECT p.id, p.title, p.summary, p.category, p.updated_at, p.is_favorite FROM prompts p

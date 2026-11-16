@@ -4,11 +4,7 @@ PromptDock 是一款运行在 macOS 上的本地提示词管理工具，支持 P
 
 ## 1. 安装应用
 
-安装包位于项目的 `release/` 目录：
-
-```text
-release/PromptDock_0.1.1_universal.dmg
-```
+从 [GitHub Releases](https://github.com/sanqi-cd/promptdock/releases/latest) 下载以 `.dmg` 结尾的 universal 安装包和同一版本的 `SHA256SUMS.txt`。Apple Silicon 和 Intel Mac 使用同一个安装包。
 
 双击打开 DMG 文件。
 
@@ -26,17 +22,11 @@ release/PromptDock_0.1.1_universal.dmg
 shasum -a 256 -c SHA256SUMS.txt
 ```
 
-如果使用的是项目内置安装包，则从仓库根目录运行：
-
-```bash
-(cd release && shasum -a 256 -c SHA256SUMS.txt)
-```
-
 看到 DMG 文件名后显示 `OK` 才继续安装；如果校验失败，请重新下载，不要打开安装包。
 
 ## 2. 处理 macOS 安全提示
 
-默认未配置 Apple 凭据的构建未进行代码签名，也未使用 Apple Developer ID 签名和 notarization。因此第一次打开时，macOS 可能会提示无法验证开发者。
+未配置 Apple 凭据时，应用使用临时签名（ad-hoc），没有 Apple Developer ID 签名和公证。因此第一次打开时，macOS 可能会提示无法验证开发者。
 
 如果出现安全提示，先选择完成或关闭提示。
 
