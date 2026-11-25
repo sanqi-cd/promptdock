@@ -64,7 +64,7 @@ jobs:
           persist-credentials: false
 
       # 版本取自 package.json 的 packageManager 字段。
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v4
         with:
