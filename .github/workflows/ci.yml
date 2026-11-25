@@ -89,7 +89,7 @@ jobs:
         run: pnpm exec playwright test
 
       # 失败时同时保留 HTML 报告和 trace/截图，否则线上挂了无从查起。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-report
@@ -97,7 +97,7 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: playwright-test-results
