@@ -135,7 +135,9 @@ DMG 输出到 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。�
 - 签名：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`
 - 公证：`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`（app-specific password，不是 Apple 账户密码）
 
-两组都可省略，但同一组必须完整；启用公证前必须启用 Developer ID 签名。CI 通过后，推送与应用版本一致的 tag（例如 `v0.1.2`），会触发 `.github/workflows/release.yml`。发布流程验证 DMG 的完整性、双架构和签名，启用公证时还会验证公证票据，然后将 DMG 和 `SHA256SUMS.txt` 上传到 GitHub Releases。
+两组都可省略，但同一组必须完整；启用公证前必须启用 Developer ID 签名。CI 通过后，推送与应用版本一致的 tag（例如 `v0.1.3`），会触发 `.github/workflows/release.yml`。发布流程先复用 CI，对标签对应的同一提交重新执行前端测试、Rust 测试及最新依赖安全审计；全部通过后才开始构建。随后验证 DMG 的完整性、双架构和签名，启用公证时还会验证公证票据，最后将 DMG 和 `SHA256SUMS.txt` 上传到 GitHub Releases。
+
+Dependabot 每周为 Rust、前端和 GitHub Actions 创建依赖更新 PR。更新需人工审核并通过 CI，不会自动合并或发布。[更新记录](CHANGELOG.md)列出已发布版本的变更。
 
 如需正式面向普通用户分发，建议补齐 Apple Developer ID 签名、notarization 和 stapling。
 

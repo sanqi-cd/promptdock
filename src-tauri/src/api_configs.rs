@@ -404,6 +404,20 @@ mod tests {
     const VALID_MODEL: &str = "gpt-4.1-mini";
 
     #[test]
+    fn nested_blob_urls_have_opaque_origins_and_are_not_api_endpoints() {
+        // RUSTSEC-2026-0592: origin computation must not recurse into blob URLs.
+        for depth in [2, 10_000] {
+            let input = format!("{}https://example.com/", "blob:".repeat(depth));
+            let url = reqwest::Url::parse(&input).expect("parse nested blob URL");
+            assert_eq!(url.origin().ascii_serialization(), "null");
+            assert!(validate_base_url(&input).is_err());
+        }
+        let url = reqwest::Url::parse(VALID_URL).expect("parse HTTPS URL");
+        assert_eq!(url.origin().ascii_serialization(), "https://api.openai.com");
+        assert!(validate_base_url(VALID_URL).is_ok());
+    }
+
+    #[test]
     fn validate_config_fields_accepts_a_well_formed_config() {
         assert!(validate_config_fields(VALID_NAME, VALID_PROVIDER, VALID_URL, VALID_MODEL).is_ok());
     }

@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
   schedule:
     # 每周一 03:17 UTC 重新审计 npm 与 Rust 依赖。
     - cron: "17 3 * * 1"
@@ -15,7 +16,7 @@ permissions:
 
 # 同一分支上的旧运行会被新提交取消，避免堆积。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -45,7 +46,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
       - name: cargo clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
       # cargo-audit 默认在发现漏洞时以非零退出；未维护/unsound 只告警。
       - name: cargo audit

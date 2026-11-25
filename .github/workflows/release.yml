@@ -5,15 +5,21 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+
   macos-universal:
     name: macOS universal DMG
+    needs: validate
+    permissions:
+      contents: write
     runs-on: macos-latest
     timeout-minutes: 90
     env:
@@ -144,6 +150,8 @@ jobs:
           (cd release-artifacts && shasum -a 256 "${dmg_path##*/}" > SHA256SUMS.txt)
           {
             echo "PromptDock ${GITHUB_REF_NAME}（macOS universal，Apple Silicon + Intel）"
+            echo
+            echo "完整更新记录：https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md"
             echo
             if [[ "${signing}" == 1 ]]; then
               echo "- Developer ID 签名已通过 codesign 验证。"
